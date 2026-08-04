@@ -66,6 +66,7 @@ function usage() {
   echo "  --delete-all                           Delete core system and all registered demos"
   echo "  --ateapi-client-auth=cert|token        Select how in-cluster clients authenticate to ateapi for --deploy-ate-system (default: cert; the server always accepts both)"
   echo "  --atenet-router=envoy|agentgateway     Select the atenet router dataplane (default: envoy)"
+  echo "  --install-docker-pull-secret[=NAME]    Install image pull secret from current Docker login config (default: ate-docker-pull-secret)"
   echo ""
   echo "Infrastructure components:"
   echo ""
@@ -156,6 +157,79 @@ atenet_router() {
       exit 1
       ;;
   esac
+}
+
+docker_config_file() {
+  if [[ -n "${DOCKER_CONFIG:-}" ]]; then
+    echo "${DOCKER_CONFIG}/config.json"
+    return
+  fi
+  if [[ -n "${HOME:-}" ]]; then
+    echo "${HOME}/.docker/config.json"
+    return
+  fi
+  echo "Error: HOME or DOCKER_CONFIG must be set to locate Docker login config" >&2
+  exit 1
+}
+
+docker_pull_secret_name() {
+  echo "${ATE_DOCKER_PULL_SECRET_NAME:-ate-docker-pull-secret}"
+}
+
+validate_docker_pull_secret_name() {
+  local secret_name="$1"
+  if [[ ${#secret_name} -gt 253 || ! "${secret_name}" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+    echo "Error: Docker pull secret name must be a valid Kubernetes DNS label, got '${secret_name}'" >&2
+    exit 1
+  fi
+}
+
+install_docker_pull_secret_in_namespace() {
+  local namespace="$1"
+  shift
+  local secret_name=""
+  secret_name="$(docker_pull_secret_name)"
+  local docker_config=""
+  docker_config="$(docker_config_file)"
+
+  if [[ ! -f "${docker_config}" ]]; then
+    echo "Error: Docker config not found at ${docker_config}; run docker login first" >&2
+    exit 1
+  fi
+
+  run_kubectl create namespace "${namespace}" --dry-run=client -o yaml \
+    | run_kubectl apply -f -
+  run_kubectl create secret generic "${secret_name}" \
+    --from-file=.dockerconfigjson="${docker_config}" \
+    --type=kubernetes.io/dockerconfigjson \
+    -n "${namespace}" \
+    --dry-run=client -o yaml \
+    | run_kubectl apply -f -
+
+  local service_account=""
+  for service_account in "$@"; do
+    run_kubectl get serviceaccount "${service_account}" -n "${namespace}" >/dev/null 2>&1 \
+      || run_kubectl create serviceaccount "${service_account}" -n "${namespace}"
+    run_kubectl patch serviceaccount "${service_account}" -n "${namespace}" \
+      -p "{\"imagePullSecrets\":[{\"name\":\"${secret_name}\"}]}"
+  done
+}
+
+install_docker_pull_secret() {
+  local secret_name=""
+  secret_name="$(docker_pull_secret_name)"
+  validate_docker_pull_secret_name "${secret_name}"
+  log_step "install_docker_pull_secret (${secret_name})"
+
+  install_docker_pull_secret_in_namespace ate-system \
+    ate-api-server ate-controller atelet atenet-router atenet-dns
+  install_docker_pull_secret_in_namespace podcertificate-controller-system default
+}
+
+maybe_install_docker_pull_secret() {
+  if [[ "${INSTALL_DOCKER_PULL_SECRET:-false}" == "true" ]]; then
+    install_docker_pull_secret
+  fi
 }
 
 render_ate_system_manifests() {
@@ -346,6 +420,7 @@ deploy_ate_system() {
     && run_kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/ate-system --timeout=60s
 
   ensure_apiserver_prerequisites
+  maybe_install_docker_pull_secret
 
   # Deploy podcertificate-controller first so it starts signing and creating trust bundles immediately
   run_ko apply -f manifests/ate-install/pod-certificate-controller.yaml
@@ -397,6 +472,7 @@ deploy_ate_apiserver() {
     && run_kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/ate-system --timeout=60s
 
   ensure_apiserver_prerequisites
+  maybe_install_docker_pull_secret
 
   run_ko apply -f manifests/ate-install/ate-api-server.yaml
   run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout=120s
@@ -409,6 +485,8 @@ deploy_atelet() {
   # Ensure namespace exists
   run_kubectl apply -f manifests/ate-install/ate-system-namespace.yaml \
     && run_kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/ate-system --timeout=60s
+
+  maybe_install_docker_pull_secret
 
   local manifest=""
   if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
@@ -429,6 +507,8 @@ deploy_atenet() {
   # Ensure namespace exists
   run_kubectl apply -f manifests/ate-install/ate-system-namespace.yaml \
     && run_kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/ate-system --timeout=60s
+
+  maybe_install_docker_pull_secret
 
   local router_manifest=""
   router_manifest="$(render_atenet_router_manifest)"
@@ -599,6 +679,7 @@ done
 # --deploy-benchmarks). The dispatch loop below also accepts these flags but
 # treats them as no-ops since the value is already captured here.
 BENCHMARK_WORKER_COUNT=1
+INSTALL_DOCKER_PULL_SECRET=false
 prescan_args=("$@")
 for ((i = 0; i < ${#prescan_args[@]}; i++)); do
   case "${prescan_args[i]}" in
@@ -623,6 +704,13 @@ for ((i = 0; i < ${#prescan_args[@]}; i++)); do
       ;;
     --benchmark-worker-count=*)
       BENCHMARK_WORKER_COUNT="${prescan_args[i]#*=}"
+      ;;
+    --install-docker-pull-secret)
+      INSTALL_DOCKER_PULL_SECRET=true
+      ;;
+    --install-docker-pull-secret=*)
+      INSTALL_DOCKER_PULL_SECRET=true
+      ATE_DOCKER_PULL_SECRET_NAME="${prescan_args[i]#*=}"
       ;;
   esac
 done
@@ -673,6 +761,8 @@ while [[ "$#" -gt 0 ]]; do
 
     --deploy-benchmarks) deploy_benchmarks ;;
     --delete-benchmarks) delete_benchmarks ;;
+    --install-docker-pull-secret) install_docker_pull_secret ;;
+    --install-docker-pull-secret=*) install_docker_pull_secret ;;
     # Value captured in the pre-scan above; consume the value arg here so the
     # dispatch loop's `*)` unknown-option branch doesn't reject it.
     --benchmark-worker-count) shift ;;
