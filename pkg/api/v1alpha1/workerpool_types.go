@@ -49,6 +49,14 @@ type WorkerPoolPodTemplate struct {
 	//
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// ImagePullSecrets references Secrets in the WorkerPool namespace to use when
+	// pulling the worker pod image.
+	//
+	// +optional
+	// +kubebuilder:validation:MaxItems=16
+	// +listType=atomic
+	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
 }
 
 type WorkerPoolSpec struct {

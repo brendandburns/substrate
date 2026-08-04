@@ -206,6 +206,11 @@ func (r *envoyrunner) reconcileEnvoyDeployment(ctx context.Context) error {
 			},
 		},
 	}
+	if r.cfg.ImagePullSecret != "" {
+		dep.Spec.Template.Spec.ImagePullSecrets = []corev1.LocalObjectReference{{
+			Name: r.cfg.ImagePullSecret,
+		}}
+	}
 
 	var existing appsv1.Deployment
 	err := r.k8sClient.Get(ctx, client.ObjectKey{Namespace: r.cfg.Namespace, Name: EnvoyDeploymentName}, &existing)

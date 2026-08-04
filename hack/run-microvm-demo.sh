@@ -151,6 +151,7 @@ log "Applying the counter-microvm demo manifest..."
 VIRTIOFSD_SHA256="$(sha256sum "${OUT}/virtiofsd" | awk '{print $1}')"
 sed -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
     -e "s|\${VIRTIOFSD_SHA256}|${VIRTIOFSD_SHA256}|g" \
+    -e "/\${WORKERPOOL_PULL_SECRETS}/d" \
     demos/counter/counter-microvm.yaml.tmpl \
   | ./hack/run-tool.sh ko apply -f - ${KUBECTL_CONTEXT:+-- --context="${KUBECTL_CONTEXT}"}
 

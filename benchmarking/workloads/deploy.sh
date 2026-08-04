@@ -48,9 +48,18 @@ usage() {
   echo "  -h, --help           Show this help message"
 }
 
+workerpool_pull_secret_sed_expr() {
+  if [[ -n "${ATE_DOCKER_PULL_SECRET_NAME:-}" ]]; then
+    printf 's|${WORKERPOOL_PULL_SECRETS}|  template:\\n    imagePullSecrets:\\n    - name: %s|g' "${ATE_DOCKER_PULL_SECRET_NAME}"
+    return
+  fi
+  printf '/${WORKERPOOL_PULL_SECRETS}/d'
+}
+
 substitute() {
   sed -e "s|\${BUCKET_NAME}|${BUCKET_NAME}|g" \
       -e "s|\${WORKER_COUNT}|${WORKER_COUNT}|g" \
+      -e "$(workerpool_pull_secret_sed_expr)" \
       "${MANIFEST_TEMPLATE}"
 }
 

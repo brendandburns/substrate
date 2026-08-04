@@ -42,21 +42,22 @@ type authConfig struct {
 
 // routerConfig holds deployment setup and endpoint options for the router node instance.
 type routerConfig struct {
-	Standalone     bool
-	AtenetRouter   string
-	Namespace      string
-	Kubeconfig     string
-	AteapiAddr     string
-	HttpPort       int
-	XdsPort        int
-	ExtprocPort    int
-	ExtprocAddr    string
-	EnvoyImage     string
-	TemplatesFile  string
-	StatusPort     int
-	HealthInterval time.Duration
-	HttpsPort      int
-	EnvoyCertPath  string
+	Standalone      bool
+	AtenetRouter    string
+	Namespace       string
+	Kubeconfig      string
+	AteapiAddr      string
+	HttpPort        int
+	XdsPort         int
+	ExtprocPort     int
+	ExtprocAddr     string
+	EnvoyImage      string
+	ImagePullSecret string
+	TemplatesFile   string
+	StatusPort      int
+	HealthInterval  time.Duration
+	HttpsPort       int
+	EnvoyCertPath   string
 
 	// UpstreamCredentialBundlePath is the router's podidentity credential bundle
 	// (cert+key) presented as the client cert when dialing the actor's atunnel

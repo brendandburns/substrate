@@ -222,7 +222,7 @@ install_docker_pull_secret() {
   log_step "install_docker_pull_secret (${secret_name})"
 
   install_docker_pull_secret_in_namespace ate-system \
-    ate-api-server ate-controller atelet atenet-router atenet-dns
+    default ate-api-server ate-controller atelet atenet-router atenet-dns
   install_docker_pull_secret_in_namespace podcertificate-controller-system default
 }
 
@@ -230,6 +230,46 @@ maybe_install_docker_pull_secret() {
   if [[ "${INSTALL_DOCKER_PULL_SECRET:-false}" == "true" ]]; then
     install_docker_pull_secret
   fi
+}
+
+maybe_install_docker_pull_secret_in_namespace() {
+  if [[ "${INSTALL_DOCKER_PULL_SECRET:-false}" == "true" ]]; then
+    validate_docker_pull_secret_name "$(docker_pull_secret_name)"
+    install_docker_pull_secret_in_namespace "$@"
+  fi
+}
+
+workerpool_pull_secret_sed_expr() {
+  if [[ "${INSTALL_DOCKER_PULL_SECRET:-false}" == "true" ]]; then
+    validate_docker_pull_secret_name "$(docker_pull_secret_name)"
+    printf 's|${WORKERPOOL_PULL_SECRETS}|  template:\\n    imagePullSecrets:\\n    - name: %s|g' "$(docker_pull_secret_name)"
+    return
+  fi
+  printf '/${WORKERPOOL_PULL_SECRETS}/d'
+}
+
+apply_docker_pull_secret_to_pod_template() {
+  if [[ "${INSTALL_DOCKER_PULL_SECRET:-false}" != "true" ]]; then
+    return
+  fi
+
+  local resource="$1"
+  local namespace="$2"
+  local secret_name=""
+  secret_name="$(docker_pull_secret_name)"
+  validate_docker_pull_secret_name "${secret_name}"
+
+  run_kubectl patch "${resource}" -n "${namespace}" --type=merge \
+    -p "{\"spec\":{\"template\":{\"spec\":{\"imagePullSecrets\":[{\"name\":\"${secret_name}\"}]}}}}"
+}
+
+apply_docker_pull_secret_to_ate_system_workloads() {
+  apply_docker_pull_secret_to_pod_template deployment/ate-api-server ate-system
+  apply_docker_pull_secret_to_pod_template deployment/ate-controller ate-system
+  apply_docker_pull_secret_to_pod_template daemonset/atelet ate-system
+  apply_docker_pull_secret_to_pod_template deployment/atenet-router ate-system
+  apply_docker_pull_secret_to_pod_template deployment/dns ate-system
+  apply_docker_pull_secret_to_pod_template statefulset/valkey-cluster ate-system
 }
 
 render_ate_system_manifests() {
@@ -424,6 +464,7 @@ deploy_ate_system() {
 
   # Deploy podcertificate-controller first so it starts signing and creating trust bundles immediately
   run_ko apply -f manifests/ate-install/pod-certificate-controller.yaml
+  apply_docker_pull_secret_to_pod_template deployment/podcertificate-controller podcertificate-controller-system
   run_kubectl rollout status deployment/podcertificate-controller -n podcertificate-controller-system --timeout=120s
 
   # Wait for both ClusterTrustBundles to be created by the controller
@@ -438,6 +479,7 @@ deploy_ate_system() {
   local manifests=""
   manifests="$(render_ate_system_manifests)"
   echo "${manifests}" | run_kubectl apply -f -
+  apply_docker_pull_secret_to_ate_system_workloads
 
   log_step "Waiting for ATE system components to be ready..."
   run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout=120s
@@ -475,6 +517,7 @@ deploy_ate_apiserver() {
   maybe_install_docker_pull_secret
 
   run_ko apply -f manifests/ate-install/ate-api-server.yaml
+  apply_docker_pull_secret_to_pod_template deployment/ate-api-server ate-system
   run_kubectl rollout status deployment/ate-api-server -n ate-system --timeout=120s
 }
 
@@ -497,6 +540,7 @@ deploy_atelet() {
     manifest=$(run_ko resolve -f manifests/ate-install/atelet.yaml)
   fi
   echo "${manifest}" | run_kubectl apply -f -
+  apply_docker_pull_secret_to_pod_template daemonset/atelet ate-system
   run_kubectl rollout status daemonset/atelet -n ate-system --timeout=120s
 }
 
@@ -513,8 +557,10 @@ deploy_atenet() {
   local router_manifest=""
   router_manifest="$(render_atenet_router_manifest)"
   echo "${router_manifest}" | run_kubectl apply -f -
+  apply_docker_pull_secret_to_pod_template deployment/atenet-router ate-system
 
   run_ko apply -f manifests/ate-install/atenet-dns.yaml
+  apply_docker_pull_secret_to_pod_template deployment/dns ate-system
   run_kubectl rollout status deployment/atenet-router -n ate-system --timeout=120s
   # The Deployment in atenet-dns.yaml is named "dns"; every other resource in
   # that file is "atenet-dns". Waiting on the filename rather than the actual
