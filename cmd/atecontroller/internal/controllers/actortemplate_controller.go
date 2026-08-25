@@ -59,6 +59,7 @@ type ActorTemplateReconciler struct {
 //+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch
 //+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+//+kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch,namespace=ate-system
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -161,7 +162,7 @@ func (r *ActorTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, fmt.Errorf("while suspending golden actor: %w", err)
 		}
 
-		snapshot := resp.GetActor().GetLatestSnapshot()
+		snapshot := resp.GetActor().GetStatus().GetLatestSnapshot()
 		if snapshot == nil {
 			return ctrl.Result{}, fmt.Errorf("suspending golden actor returned no ActorSnapshot")
 		}

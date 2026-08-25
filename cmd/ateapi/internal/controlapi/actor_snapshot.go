@@ -18,20 +18,40 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
-func (s *Service) GetActorSnapshot(ctx context.Context, req *ateapipb.GetActorSnapshotRequest) (*ateapipb.ActorSnapshot, error) {
-	if err := validateActorSnapshotRef(req.GetSnapshot(), "snapshot"); err != nil {
-		return nil, err
+// actorSnapshotTagScopes lists the scopes a client may set on an ActorSnapshotTag.
+// ACTOR_SNAPSHOT_TAG_SCOPE_UNSPECIFIED is deliberately absent: scope is required
+// on the wire, not defaulted. See validateActorSnapshotTagScope.
+var actorSnapshotTagScopes = []ateapipb.ActorSnapshotTagScope{
+	ateapipb.ActorSnapshotTagScope_ACTOR_SNAPSHOT_TAG_SCOPE_ATESPACE,
+	ateapipb.ActorSnapshotTagScope_ACTOR_SNAPSHOT_TAG_SCOPE_PUBLISHED,
+}
+
+// actorSnapshotTagScopeNames names actorSnapshotTagScopes for error messages.
+var actorSnapshotTagScopeNames = func() []string {
+	names := make([]string, len(actorSnapshotTagScopes))
+	for i, scope := range actorSnapshotTagScopes {
+		names[i] = scope.String()
 	}
-	snapshot, _, _, _, err := s.getActorSnapshot(ctx, req.GetSnapshot())
+	return names
+}()
+
+func (s *RPCService) GetActorSnapshot(ctx context.Context, req *ateapipb.GetActorSnapshotRequest) (*ateapipb.ActorSnapshot, error) {
+	if errs := validateGetActorSnapshotRequest(req); len(errs) > 0 {
+		return nil, toGRPCStatusError(errs)
+	}
+	snapshot, err := s.persistence.GetActorSnapshot(ctx, req.GetSnapshot().GetAtespace(), req.GetSnapshot().GetName())
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, status.Error(codes.NotFound, "ActorSnapshot not found")
 	}
@@ -41,58 +61,90 @@ func (s *Service) GetActorSnapshot(ctx context.Context, req *ateapipb.GetActorSn
 	return snapshot, nil
 }
 
-func (s *Service) ListActorSnapshots(ctx context.Context, req *ateapipb.ListActorSnapshotsRequest) (*ateapipb.ListActorSnapshotsResponse, error) {
+func validateGetActorSnapshotRequest(req *ateapipb.GetActorSnapshotRequest) field.ErrorList {
 	var fldPath *field.Path
 	var errs field.ErrorList
-	if req.GetAtespace() != "" {
-		errs = append(errs, resources.ValidateResourceName(req.GetAtespace(), fldPath.Child("atespace"))...)
+
+	if val, fldPath := req.Snapshot, fldPath.Child("snapshot"); val == nil {
+		errs = append(errs, field.Required(fldPath, ""))
+	} else {
+		errs = append(errs, resources.ValidateObjectRef(val, fldPath)...)
 	}
-	if req.GetPageSize() < 0 {
-		errs = append(errs, field.Invalid(fldPath.Child("page_size"), req.GetPageSize(), "must be greater than or equal to 0"))
-	}
-	if len(errs) > 0 {
-		return nil, status.Error(codes.InvalidArgument, errs.ToAggregate().Error())
-	}
-	snapshots, nextToken, err := s.persistence.ListActorSnapshots(ctx, req.GetAtespace(), effectivePageSize(req.GetPageSize()), req.GetPageToken())
-	if err != nil {
-		return nil, fmt.Errorf("while listing actor snapshots: %w", err)
-	}
-	return &ateapipb.ListActorSnapshotsResponse{Snapshots: snapshots, NextPageToken: nextToken}, nil
+
+	return errs
 }
 
-func (s *Service) TagActorSnapshot(ctx context.Context, req *ateapipb.TagActorSnapshotRequest) (*ateapipb.ActorSnapshotTag, error) {
-	if err := validateActorSnapshotRef(req.GetSnapshot(), "snapshot"); err != nil {
-		return nil, err
+func (s *RPCService) GetActorSnapshotTag(ctx context.Context, req *ateapipb.GetActorSnapshotTagRequest) (*ateapipb.ActorSnapshotTag, error) {
+	if errs := validateGetActorSnapshotTagRequest(req); len(errs) > 0 {
+		return nil, toGRPCStatusError(errs)
 	}
-	if err := validateActorSnapshotTag(req.GetTag(), "tag"); err != nil {
-		return nil, err
+	tag, err := s.persistence.GetActorSnapshotTag(ctx, req.GetTag().GetAtespace(), req.GetTag().GetName())
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, status.Error(codes.NotFound, "ActorSnapshot tag not found")
 	}
-	lock, _, ref, _, err := s.lockActorSnapshot(ctx, req.GetSnapshot())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("while getting actor snapshot tag: %w", err)
 	}
-	defer lock.Close()
-	if req.GetTag().GetMetadata().GetAtespace() != ref.GetAtespace() {
+	return tag, nil
+}
+
+func validateGetActorSnapshotTagRequest(req *ateapipb.GetActorSnapshotTagRequest) field.ErrorList {
+	var fldPath *field.Path
+	var errs field.ErrorList
+
+	if val, fldPath := req.Tag, fldPath.Child("tag"); val == nil {
+		errs = append(errs, field.Required(fldPath, ""))
+	} else {
+		errs = append(errs, resources.ValidateObjectRef(val, fldPath)...)
+	}
+
+	return errs
+}
+
+func (s *RPCService) ListActorSnapshots(ctx context.Context, req *ateapipb.ListActorSnapshotsRequest) (*ateapipb.ListActorSnapshotsResponse, error) {
+	if errs := validateListActorSnapshotsRequest(req); len(errs) > 0 {
+		return nil, toGRPCStatusError(errs)
+	}
+	page, err := s.persistence.ListActorSnapshots(ctx, req.GetAtespace(), store.ListOptions{PageSize: effectivePageSize(req.GetPageSize()), PageToken: req.GetPageToken()})
+	if err != nil {
+		return nil, mapListError(fmt.Errorf("while listing actor snapshots: %w", err))
+	}
+	return &ateapipb.ListActorSnapshotsResponse{Snapshots: page.Items, NextPageToken: page.NextPageToken}, nil
+}
+
+func validateListActorSnapshotsRequest(req *ateapipb.ListActorSnapshotsRequest) field.ErrorList {
+	var fldPath *field.Path
+	var errs field.ErrorList
+
+	// An empty atespace is allowed here and means "all atespaces".
+	if val, fldPath := req.Atespace, fldPath.Child("atespace"); val != "" {
+		errs = append(errs, resources.ValidateResourceName(val, fldPath)...)
+	}
+
+	if val, fldPath := req.PageSize, fldPath.Child("page_size"); val < 0 {
+		errs = append(errs, field.Invalid(fldPath, val, "must be greater than or equal to 0"))
+	}
+
+	return errs
+}
+
+func (s *RPCService) CreateActorSnapshotTag(ctx context.Context, req *ateapipb.CreateActorSnapshotTagRequest) (*ateapipb.ActorSnapshotTag, error) {
+	if errs := validateCreateActorSnapshotTagRequest(req); len(errs) > 0 {
+		return nil, toGRPCStatusError(errs)
+	}
+	ref := req.GetActorSnapshotTag().GetSnapshot()
+	if req.GetActorSnapshotTag().GetMetadata().GetAtespace() != ref.GetAtespace() {
 		return nil, status.Error(codes.FailedPrecondition, "ActorSnapshot tags must belong to the snapshot's Atespace")
 	}
-	atespaceLock, err := s.persistence.AcquireLock(lock.Context(), "lock:atespace:"+req.GetTag().GetMetadata().GetAtespace())
-	if errors.Is(err, store.ErrLockConflict) {
-		return nil, status.Error(codes.Aborted, "another operation is using this Atespace")
+	tag, err := s.persistence.CreateActorSnapshotTag(ctx, ref.GetAtespace(), ref.GetName(), req.GetActorSnapshotTag())
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, status.Error(codes.NotFound, "ActorSnapshot not found")
 	}
-	if err != nil {
-		return nil, fmt.Errorf("while locking tag Atespace: %w", err)
+	if errors.Is(err, store.ErrFailedPrecondition) {
+		return nil, status.Errorf(codes.FailedPrecondition, "Atespace %s not found", req.GetActorSnapshotTag().GetMetadata().GetAtespace())
 	}
-	defer atespaceLock.Close()
-	exists, err := s.persistence.AtespaceExists(atespaceLock.Context(), req.GetTag().GetMetadata().GetAtespace())
-	if err != nil {
-		return nil, fmt.Errorf("while checking tag Atespace: %w", err)
-	}
-	if !exists {
-		return nil, status.Errorf(codes.FailedPrecondition, "Atespace %s not found", req.GetTag().GetMetadata().GetAtespace())
-	}
-	tag, err := s.persistence.TagActorSnapshot(atespaceLock.Context(), ref.GetAtespace(), ref.GetName(), req.GetTag())
 	if errors.Is(err, store.ErrAlreadyExists) {
-		return nil, status.Errorf(codes.AlreadyExists, "ActorSnapshot tag %s/%s already exists", req.GetTag().GetMetadata().GetAtespace(), req.GetTag().GetMetadata().GetName())
+		return nil, status.Errorf(codes.AlreadyExists, "ActorSnapshot tag %s/%s already exists", req.GetActorSnapshotTag().GetMetadata().GetAtespace(), req.GetActorSnapshotTag().GetMetadata().GetName())
 	}
 	if err != nil {
 		return nil, fmt.Errorf("while tagging actor snapshot: %w", err)
@@ -100,48 +152,91 @@ func (s *Service) TagActorSnapshot(ctx context.Context, req *ateapipb.TagActorSn
 	return tag, nil
 }
 
-func (s *Service) UpdateActorSnapshotTag(ctx context.Context, req *ateapipb.UpdateActorSnapshotTagRequest) (*ateapipb.ActorSnapshotTag, error) {
-	if errs := resources.ValidateObjectRef(req.GetTag(), field.NewPath("tag")); len(errs) > 0 {
-		return nil, status.Error(codes.InvalidArgument, errs.ToAggregate().Error())
+func validateCreateActorSnapshotTagRequest(req *ateapipb.CreateActorSnapshotTagRequest) field.ErrorList {
+	var fldPath *field.Path
+	var errs field.ErrorList
+
+	tag := req.ActorSnapshotTag
+	tagPath := fldPath.Child("actor_snapshot_tag")
+	if tag == nil {
+		errs = append(errs, field.Required(tagPath, ""))
+		return errs
 	}
-	if err := validateActorSnapshotTagScope(req.GetScope()); err != nil {
-		return nil, err
+
+	errs = append(errs, resources.ValidateObjectRef(&ateapipb.ObjectRef{Atespace: tag.GetMetadata().GetAtespace(), Name: tag.GetMetadata().GetName()}, tagPath.Child("metadata"))...)
+
+	if val, p := tag.Snapshot, tagPath.Child("snapshot"); val == nil {
+		errs = append(errs, field.Required(p, ""))
+	} else {
+		errs = append(errs, resources.ValidateObjectRef(val, p)...)
 	}
-	ref := &ateapipb.ActorSnapshotRef{Reference: &ateapipb.ActorSnapshotRef_Tag{Tag: req.GetTag()}}
-	lock, _, _, _, err := s.lockActorSnapshot(ctx, ref)
-	if err != nil {
-		return nil, err
-	}
-	defer lock.Close()
-	atespaceLock, err := s.persistence.AcquireLock(lock.Context(), "lock:atespace:"+req.GetTag().GetAtespace())
-	if errors.Is(err, store.ErrLockConflict) {
-		return nil, status.Error(codes.Aborted, "another operation is using this Atespace")
-	}
-	if err != nil {
-		return nil, fmt.Errorf("while locking tag Atespace: %w", err)
-	}
-	defer atespaceLock.Close()
-	tag, err := s.persistence.UpdateActorSnapshotTag(atespaceLock.Context(), req.GetTag().GetAtespace(), req.GetTag().GetName(), req.GetScope())
-	if errors.Is(err, store.ErrNotFound) {
-		return nil, status.Errorf(codes.NotFound, "ActorSnapshot tag %s/%s not found", req.GetTag().GetAtespace(), req.GetTag().GetName())
-	}
-	if err != nil {
-		return nil, fmt.Errorf("while updating actor snapshot tag: %w", err)
-	}
-	return tag, nil
+
+	errs = append(errs, validateActorSnapshotTagScope(tag.GetScope(), tagPath.Child("scope"))...)
+
+	return errs
 }
 
-func (s *Service) DeleteActorSnapshotTag(ctx context.Context, req *ateapipb.DeleteActorSnapshotTagRequest) (*ateapipb.ActorSnapshotTag, error) {
-	if errs := resources.ValidateObjectRef(req.GetTag(), field.NewPath("tag")); len(errs) > 0 {
-		return nil, status.Error(codes.InvalidArgument, errs.ToAggregate().Error())
+func (s *RPCService) UpdateActorSnapshotTag(ctx context.Context, req *ateapipb.UpdateActorSnapshotTagRequest) (*ateapipb.ActorSnapshotTag, error) {
+	if errs := validateUpdateActorSnapshotTagRequest(req); len(errs) > 0 {
+		return nil, toGRPCStatusError(errs)
 	}
-	ref := &ateapipb.ActorSnapshotRef{Reference: &ateapipb.ActorSnapshotRef_Tag{Tag: req.GetTag()}}
-	lock, _, _, _, err := s.lockActorSnapshot(ctx, ref)
+	in := req.GetTag()
+	atespace, name := in.GetMetadata().GetAtespace(), in.GetMetadata().GetName()
+
+	storedTag, err := s.persistence.UpdateActorSnapshotTag(ctx, atespace, name, store.PreconditionFrom(in), func(toUpdate *ateapipb.ActorSnapshotTag) error {
+		// Metadata is a server-owned field.
+		metadata := toUpdate.GetMetadata()
+		// Reset + merge from the input tag.
+		// TODO: Drop unknwown fields from the input actor.
+		proto.Reset(toUpdate)
+		proto.Merge(toUpdate, in)
+		// Restore metadata from the server.
+		toUpdate.Metadata = metadata
+		return nil
+	})
 	if err != nil {
-		return nil, err
+		if errors.Is(err, store.ErrImmutableField) {
+			return nil, status.Errorf(codes.InvalidArgument, "while updating actor snapshot tag %s/%s: %v", atespace, name, err)
+		}
+		if errors.Is(err, store.ErrVersionConflict) {
+			return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")
+		}
+		if errors.Is(err, store.ErrUIDConflict) {
+			return nil, status.Errorf(codes.Aborted, "ActorSnapshot tag %s/%s not found with uid %s", atespace, name, in.GetMetadata().GetUid())
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, status.Errorf(codes.NotFound, "ActorSnapshot tag %s/%s not found", atespace, name)
+		}
+		if errors.Is(err, store.ErrPreconditionRequired) {
+			return nil, status.Errorf(codes.InvalidArgument, "while updating actor snapshot tag %s/%s: %v", atespace, name, err)
+		}
+		return nil, fmt.Errorf("while updating actor snapshot tag: %w", err)
 	}
-	defer lock.Close()
-	tag, err := s.persistence.DeleteActorSnapshotTag(lock.Context(), req.GetTag().GetAtespace(), req.GetTag().GetName())
+	return storedTag, nil
+}
+
+func validateUpdateActorSnapshotTagRequest(req *ateapipb.UpdateActorSnapshotTagRequest) field.ErrorList {
+	var fldPath *field.Path
+	var errs field.ErrorList
+
+	tag := req.GetTag()
+	tagPath := fldPath.Child("tag")
+	if tag == nil {
+		return field.ErrorList{field.Required(tagPath, "")}
+	}
+
+	errs = append(errs, resources.ValidateUpdateMetadataRef(tag.GetMetadata(), tagPath.Child("metadata"))...)
+
+	errs = append(errs, validateActorSnapshotTagScope(tag.GetScope(), tagPath.Child("scope"))...)
+
+	return errs
+}
+
+func (s *RPCService) DeleteActorSnapshotTag(ctx context.Context, req *ateapipb.DeleteActorSnapshotTagRequest) (*ateapipb.ActorSnapshotTag, error) {
+	if errs := validateDeleteActorSnapshotTagRequest(req); len(errs) > 0 {
+		return nil, toGRPCStatusError(errs)
+	}
+	tag, err := s.persistence.DeleteActorSnapshotTag(ctx, req.GetTag().GetAtespace(), req.GetTag().GetName())
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, status.Errorf(codes.NotFound, "ActorSnapshot tag %s/%s not found", req.GetTag().GetAtespace(), req.GetTag().GetName())
 	}
@@ -151,95 +246,26 @@ func (s *Service) DeleteActorSnapshotTag(ctx context.Context, req *ateapipb.Dele
 	return tag, nil
 }
 
-func (s *Service) getActorSnapshot(ctx context.Context, ref *ateapipb.ActorSnapshotRef) (*ateapipb.ActorSnapshot, string, *ateapipb.ObjectRef, *ateapipb.ActorSnapshotTag, error) {
-	var snapshot *ateapipb.ActorSnapshot
-	var tag *ateapipb.ActorSnapshotTag
-	var location string
-	var err error
-	switch ref.GetReference().(type) {
-	case *ateapipb.ActorSnapshotRef_Snapshot:
-		canonical := ref.GetSnapshot()
-		snapshot, location, err = s.persistence.GetActorSnapshot(ctx, canonical.GetAtespace(), canonical.GetName())
-	case *ateapipb.ActorSnapshotRef_Tag:
-		snapshot, location, tag, err = s.persistence.GetActorSnapshotByTag(ctx, ref.GetTag().GetAtespace(), ref.GetTag().GetName())
-	default:
-		return nil, "", nil, nil, store.ErrNotFound
-	}
-	if err != nil {
-		return nil, "", nil, nil, err
-	}
-	canonical := &ateapipb.ObjectRef{Atespace: snapshot.GetMetadata().GetAtespace(), Name: snapshot.GetMetadata().GetName()}
-	return snapshot, location, canonical, tag, nil
-}
-
-func (s *Service) lockActorSnapshot(ctx context.Context, ref *ateapipb.ActorSnapshotRef) (*store.Lock, *ateapipb.ActorSnapshot, *ateapipb.ObjectRef, *ateapipb.ActorSnapshotTag, error) {
-	_, _, canonical, _, err := s.getActorSnapshot(ctx, ref)
-	if errors.Is(err, store.ErrNotFound) {
-		return nil, nil, nil, nil, status.Error(codes.NotFound, "ActorSnapshot not found")
-	}
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("while getting actor snapshot: %w", err)
-	}
-	lock, err := s.persistence.AcquireLock(ctx, "lock:actor-snapshot:"+canonical.GetAtespace()+":"+canonical.GetName())
-	if errors.Is(err, store.ErrLockConflict) {
-		return nil, nil, nil, nil, status.Error(codes.Aborted, "another operation is using this ActorSnapshot")
-	}
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("while locking actor snapshot: %w", err)
-	}
-	snapshot, _, lockedCanonical, tag, err := s.getActorSnapshot(lock.Context(), ref)
-	if err != nil || canonical.GetAtespace() != lockedCanonical.GetAtespace() || canonical.GetName() != lockedCanonical.GetName() {
-		lock.Close()
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, nil, nil, nil, status.Error(codes.NotFound, "ActorSnapshot not found")
-		}
-		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("while getting actor snapshot: %w", err)
-		}
-		return nil, nil, nil, nil, status.Error(codes.Aborted, "ActorSnapshot reference changed, please retry")
-	}
-	return lock, snapshot, lockedCanonical, tag, nil
-}
-
-func validateActorSnapshotRef(ref *ateapipb.ActorSnapshotRef, name string) error {
+func validateDeleteActorSnapshotTagRequest(req *ateapipb.DeleteActorSnapshotTagRequest) field.ErrorList {
 	var fldPath *field.Path
-	p := fldPath.Child(name)
-	if ref == nil {
-		return status.Error(codes.InvalidArgument, field.ErrorList{field.Required(p, "")}.ToAggregate().Error())
+	var errs field.ErrorList
+
+	if val, fldPath := req.Tag, fldPath.Child("tag"); val == nil {
+		errs = append(errs, field.Required(fldPath, ""))
+	} else {
+		errs = append(errs, resources.ValidateObjectRef(val, fldPath)...)
 	}
-	switch ref.GetReference().(type) {
-	case *ateapipb.ActorSnapshotRef_Snapshot:
-		if errs := resources.ValidateObjectRef(ref.GetSnapshot(), p.Child("snapshot")); len(errs) > 0 {
-			return status.Error(codes.InvalidArgument, errs.ToAggregate().Error())
-		}
-	case *ateapipb.ActorSnapshotRef_Tag:
-		if errs := resources.ValidateObjectRef(ref.GetTag(), p.Child("tag")); len(errs) > 0 {
-			return status.Error(codes.InvalidArgument, errs.ToAggregate().Error())
-		}
-	default:
-		return status.Error(codes.InvalidArgument, field.ErrorList{field.Required(p, "")}.ToAggregate().Error())
+
+	return errs
+}
+
+// validateActorSnapshotTagScope checks that scope is one a client may set.
+func validateActorSnapshotTagScope(scope ateapipb.ActorSnapshotTagScope, p *field.Path) field.ErrorList {
+	switch {
+	case scope == ateapipb.ActorSnapshotTagScope_ACTOR_SNAPSHOT_TAG_SCOPE_UNSPECIFIED:
+		return field.ErrorList{field.Required(p, "must be one of: "+strings.Join(actorSnapshotTagScopeNames, ", "))}
+	case !slices.Contains(actorSnapshotTagScopes, scope):
+		return field.ErrorList{field.NotSupported(p, scope.String(), actorSnapshotTagScopeNames)}
 	}
 	return nil
-}
-
-func validateActorSnapshotTag(tag *ateapipb.ActorSnapshotTag, name string) error {
-	var fldPath *field.Path
-	p := fldPath.Child(name)
-	if tag == nil {
-		return status.Error(codes.InvalidArgument, field.ErrorList{field.Required(p, "")}.ToAggregate().Error())
-	}
-	if errs := resources.ValidateObjectRef(&ateapipb.ObjectRef{Atespace: tag.GetMetadata().GetAtespace(), Name: tag.GetMetadata().GetName()}, p.Child("metadata")); len(errs) > 0 {
-		return status.Error(codes.InvalidArgument, errs.ToAggregate().Error())
-	}
-	return validateActorSnapshotTagScope(tag.GetScope())
-}
-
-func validateActorSnapshotTagScope(scope ateapipb.ActorSnapshotTagScope) error {
-	switch scope {
-	case ateapipb.ActorSnapshotTagScope_ACTOR_SNAPSHOT_TAG_SCOPE_ATESPACE,
-		ateapipb.ActorSnapshotTagScope_ACTOR_SNAPSHOT_TAG_SCOPE_PUBLISHED:
-		return nil
-	default:
-		return status.Error(codes.InvalidArgument, "invalid ActorSnapshot tag scope")
-	}
 }

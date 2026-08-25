@@ -22,9 +22,12 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/storetest"
+	"github.com/agent-substrate/substrate/internal/ateattr"
 	"github.com/agent-substrate/substrate/internal/ateerrors"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -33,15 +36,26 @@ import (
 // tests can assert they are cleared when the actor crashes.
 func seedActor(t *testing.T, ctx context.Context, st store.Interface, actorRef resources.ActorRef) {
 	t.Helper()
+
+	atespace := &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: actorRef.Atespace}}
+	if _, err := st.CreateAtespace(ctx, atespace); err != nil {
+		t.Fatalf("Failed to CreateAtespace: %v", err)
+	}
+
 	if _, err := st.CreateActor(ctx, &ateapipb.Actor{
-		Metadata:           &ateapipb.ResourceMetadata{Name: actorRef.Name, Atespace: actorRef.Atespace},
-		Status:             ateapipb.Actor_STATUS_RUNNING,
-		AteomPodNamespace:  "ns",
-		AteomPodName:       "pod",
-		AteomPodIp:         "1.2.3.4",
-		AteomPodUid:        "uid",
-		WorkerPoolName:     "pool",
-		InProgressSnapshot: "gs://snapshots/actor-1/reserved",
+		Metadata: &ateapipb.ResourceMetadata{Name: actorRef.Name, Atespace: actorRef.Atespace},
+		Status: &ateapipb.ActorStatus{
+			State: ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			WorkerAssignment: &ateapipb.WorkerAssignment{
+				Worker:          &ateapipb.ObjectRef{Name: "uid"},
+				WorkerNamespace: "ns",
+				WorkerPool:      "pool",
+				WorkerPod:       "pod",
+				WorkerPodUid:    "uid",
+				WorkerPodIp:     "1.2.3.4",
+			},
+			InProgressSnapshotName: "reserved-snapshot",
+		},
 	}); err != nil {
 		t.Fatalf("seed actor: %v", err)
 	}
@@ -52,13 +66,25 @@ func seedActor(t *testing.T, ctx context.Context, st store.Interface, actorRef r
 func seedWorker(t *testing.T, ctx context.Context, st store.Interface, actorRef resources.ActorRef) {
 	t.Helper()
 	worker := &ateapipb.Worker{
+		Metadata:        &ateapipb.ResourceMetadata{Name: "uid"},
 		WorkerNamespace: "ns",
 		WorkerPool:      "pool",
 		WorkerPod:       "pod",
+		WorkerPodUid:    "uid",
+		Status:          &ateapipb.WorkerStatus{},
 	}
 	if actorRef != (resources.ActorRef{}) {
-		worker.Assignment = &ateapipb.Assignment{
-			Actor: actorRef.ToObjectRef(),
+		actor, err := st.GetActor(ctx, actorRef)
+		if err != nil {
+			worker.Status.Assignment = &ateapipb.ActorAssignment{
+				Actor:    &ateapipb.ObjectRef{Atespace: actorRef.Atespace, Name: actorRef.Name},
+				ActorUid: "synthetic-" + actorRef.Name,
+			}
+		} else {
+			worker.Status.Assignment = &ateapipb.ActorAssignment{
+				Actor:    &ateapipb.ObjectRef{Atespace: actor.GetMetadata().GetAtespace(), Name: actor.GetMetadata().GetName()},
+				ActorUid: actor.GetMetadata().GetUid(),
+			}
 		}
 	}
 	if err := st.CreateWorker(ctx, worker); err != nil {
@@ -70,10 +96,15 @@ func seedWorker(t *testing.T, ctx context.Context, st store.Interface, actorRef 
 // already cleared, e.g. by a prior release.
 func seedUnboundActor(t *testing.T, ctx context.Context, st store.Interface, actorRef resources.ActorRef) {
 	t.Helper()
+	if _, err := st.CreateAtespace(ctx, &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: actorRef.Atespace}}); err != nil {
+		t.Fatalf("CreateAtespace: %v", err)
+	}
 	if _, err := st.CreateActor(ctx, &ateapipb.Actor{
-		Metadata:           &ateapipb.ResourceMetadata{Name: actorRef.Name, Atespace: actorRef.Atespace},
-		Status:             ateapipb.Actor_STATUS_RUNNING,
-		InProgressSnapshot: "gs://snapshots/actor-1/reserved",
+		Metadata: &ateapipb.ResourceMetadata{Name: actorRef.Name, Atespace: actorRef.Atespace},
+		Status: &ateapipb.ActorStatus{
+			State:                  ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			InProgressSnapshotName: "reserved-snapshot",
+		},
 	}); err != nil {
 		t.Fatalf("seed unbound actor: %v", err)
 	}
@@ -87,23 +118,15 @@ func assertCrashed(t *testing.T, ctx context.Context, st store.Interface, actorR
 	if err != nil {
 		t.Fatalf("GetActor(%v) = %v, want nil", actorRef, err)
 	}
-	if got.GetStatus() != ateapipb.Actor_STATUS_CRASHED {
-		t.Errorf("status = %v, want %v", got.GetStatus(), ateapipb.Actor_STATUS_CRASHED)
+	if got.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_CRASHED {
+		t.Errorf("status = %v, want %v", got.GetStatus().GetState(), ateapipb.ActorState_ACTOR_STATE_CRASHED)
 	}
 	// Keep the snapshot uri for debugging.
-	if got.GetInProgressSnapshot() == "" {
-		t.Error(`InProgressSnapshot = "", want preserved`)
+	if got.GetStatus().GetInProgressSnapshotName() == "" {
+		t.Error(`InProgressSnapshotName = "", want preserved`)
 	}
-	for field, val := range map[string]string{
-		"AteomPodNamespace": got.GetAteomPodNamespace(),
-		"AteomPodName":      got.GetAteomPodName(),
-		"AteomPodIp":        got.GetAteomPodIp(),
-		"AteomPodUid":       got.GetAteomPodUid(),
-		"WorkerPoolName":    got.GetWorkerPoolName(),
-	} {
-		if val != "" {
-			t.Errorf("%s = %q, want cleared", field, val)
-		}
+	if got.GetStatus().GetWorkerAssignment() != nil {
+		t.Errorf("WorkerAssignment = %v, want cleared", got.GetStatus().GetWorkerAssignment())
 	}
 }
 
@@ -139,12 +162,12 @@ func TestCrashActor(t *testing.T) {
 					t.Fatalf("crashActor() = %v, want nil", err)
 				}
 				assertCrashed(t, ctx, st, actorRef)
-				worker, gerr := st.GetWorker(ctx, "ns", "pool", "pod")
+				worker, gerr := st.GetWorker(ctx, "uid")
 				if gerr != nil {
 					t.Fatalf("GetWorker() = %v, want nil", gerr)
 				}
-				if worker.GetAssignment() != nil {
-					t.Errorf("worker assignment = %v, want nil", worker.GetAssignment())
+				if worker.GetStatus().GetAssignment() != nil {
+					t.Errorf("worker assignment = %v, want nil", worker.GetStatus().GetAssignment())
 				}
 			},
 		},
@@ -159,12 +182,54 @@ func TestCrashActor(t *testing.T) {
 					t.Fatalf("crashActor() = %v, want nil", err)
 				}
 				assertCrashed(t, ctx, st, actorRef)
-				worker, gerr := st.GetWorker(ctx, "ns", "pool", "pod")
+				worker, gerr := st.GetWorker(ctx, "uid")
 				if gerr != nil {
 					t.Fatalf("GetWorker() = %v, want nil", gerr)
 				}
-				if got := worker.GetAssignment().GetActor().GetName(); got != "actor-2" {
-					t.Errorf("worker assigned actor = %q, want %q", got, "actor-2")
+				if got := worker.GetStatus().GetAssignment().GetActor().GetName(); got != "actor-2" {
+					t.Errorf("worker assigned actor name = %q, want %q", got, "actor-2")
+				}
+				if got := worker.GetStatus().GetAssignment().GetActorUid(); got != "synthetic-actor-2" {
+					t.Errorf("worker assigned actor uid = %q, want %q", got, "synthetic-actor-2")
+				}
+			},
+		},
+		{
+			name: "keeps worker assigned to previous incarnation of same actor",
+			seed: true,
+			setup: func(t *testing.T, ctx context.Context, st store.Interface) {
+				// Create a worker assigned to the same actorRef, but with a stale UID
+				worker := &ateapipb.Worker{
+					Metadata:        &ateapipb.ResourceMetadata{Name: "uid"},
+					WorkerNamespace: "ns",
+					WorkerPool:      "pool",
+					WorkerPod:       "pod",
+					WorkerPodUid:    "uid",
+					Status: &ateapipb.WorkerStatus{
+						Assignment: &ateapipb.ActorAssignment{
+							Actor:    &ateapipb.ObjectRef{Atespace: actorRef.Atespace, Name: actorRef.Name},
+							ActorUid: "stale-incarnation-uid",
+						},
+					},
+				}
+				if err := st.CreateWorker(ctx, worker); err != nil {
+					t.Fatalf("CreateWorker: %v", err)
+				}
+			},
+			check: func(t *testing.T, ctx context.Context, st store.Interface, err error) {
+				if err != nil {
+					t.Fatalf("crashActor() = %v, want nil", err)
+				}
+				assertCrashed(t, ctx, st, actorRef)
+				worker, gerr := st.GetWorker(ctx, "uid")
+				if gerr != nil {
+					t.Fatalf("GetWorker() = %v, want nil", gerr)
+				}
+				if got := worker.GetStatus().GetAssignment().GetActor().GetName(); got != actorRef.Name {
+					t.Errorf("worker assigned actor name = %q, want %q", got, actorRef.Name)
+				}
+				if got := worker.GetStatus().GetAssignment().GetActorUid(); got != "stale-incarnation-uid" {
+					t.Errorf("worker assigned actor uid = %q, want %q", got, "stale-incarnation-uid")
 				}
 			},
 		},
@@ -183,11 +248,11 @@ func TestCrashActor(t *testing.T) {
 				// Without a binding the worker cannot be looked up, so its
 				// assignment must be left untouched even though it names
 				// the crashed actor.
-				worker, gerr := st.GetWorker(ctx, "ns", "pool", "pod")
+				worker, gerr := st.GetWorker(ctx, "uid")
 				if gerr != nil {
 					t.Fatalf("GetWorker() = %v, want nil", gerr)
 				}
-				if worker.GetAssignment() == nil {
+				if worker.GetStatus().GetAssignment() == nil {
 					t.Error("worker assignment = nil, want untouched")
 				}
 			},
@@ -222,7 +287,8 @@ func TestCrashActor(t *testing.T) {
 				tt.setup(t, ctx, st)
 			}
 
-			err := crashActor(ctx, st, actorRef)
+			err := crashActor(ctx, st, actorRef, ateattr.OperationUnknown, ateattr.ReasonUnknown)
+
 			tt.check(t, ctx, st, err)
 		})
 	}
@@ -304,7 +370,7 @@ func TestMaybeCrashActor(t *testing.T) {
 				if gerr != nil {
 					t.Fatalf("GetActor() = %v, want nil", gerr)
 				}
-				if got.GetStatus() == ateapipb.Actor_STATUS_CRASHED {
+				if got.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_CRASHED {
 					t.Errorf("status = CRASHED, want it unchanged")
 				}
 			},
@@ -328,7 +394,7 @@ func TestMaybeCrashActor(t *testing.T) {
 				if gerr != nil {
 					t.Fatalf("GetActor() = %v, want nil", gerr)
 				}
-				if got.GetStatus() == ateapipb.Actor_STATUS_CRASHED {
+				if got.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_CRASHED {
 					t.Errorf("status = CRASHED, want it unchanged")
 				}
 			},
@@ -345,8 +411,173 @@ func TestMaybeCrashActor(t *testing.T) {
 				seedActor(t, ctx, st, actorRef)
 			}
 
-			err := maybeCrashActor(ctx, st, actorRef, tt.err, wrapMsg)
+			err := maybeCrashActor(ctx, st, actorRef, tt.err, wrapMsg, ateattr.OperationUnknown)
+
 			tt.check(t, ctx, st, err)
 		})
+	}
+}
+
+func TestCrashActor_Metrics(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	meter := mp.Meter("test")
+	if err := RegisterActorCrashes(meter); err != nil {
+		t.Fatalf("RegisterActorCrashes: %v", err)
+	}
+
+	ctx := context.Background()
+	st, cleanup := storetest.SetupTestStore(t)
+	defer cleanup()
+
+	actorRef := resources.ActorRef{Atespace: "demo-ns", Name: "counter-actor"}
+	worker := &ateapipb.Worker{
+		Metadata:        &ateapipb.ResourceMetadata{Name: "pod-uid-1"},
+		WorkerNamespace: "demo-ns",
+		WorkerPool:      "pool-1",
+		WorkerPod:       "pod-1",
+		WorkerPodUid:    "pod-uid-1",
+		SandboxClass:    "gvisor",
+		Status: &ateapipb.WorkerStatus{
+			Assignment: &ateapipb.ActorAssignment{
+				Actor: &ateapipb.ObjectRef{Atespace: actorRef.Atespace, Name: actorRef.Name},
+			},
+		},
+	}
+	if err := st.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	actor := &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{
+			Atespace: "demo-ns",
+			Name:     "counter-actor",
+			Uid:      "actor-uid-1",
+		},
+		ActorTemplateNamespace: "demo-ns",
+		ActorTemplateName:      "counter-template",
+		Status: &ateapipb.ActorStatus{
+			State: ateapipb.ActorState_ACTOR_STATE_RUNNING,
+			WorkerAssignment: &ateapipb.WorkerAssignment{
+				Worker:          &ateapipb.ObjectRef{Name: "pod-uid-1"},
+				WorkerNamespace: "demo-ns",
+				WorkerPool:      "pool-1",
+				WorkerPod:       "pod-1",
+				WorkerPodUid:    "pod-uid-1",
+			},
+		},
+	}
+	if _, err := st.CreateAtespace(ctx, &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: actor.Metadata.Atespace}}); err != nil {
+		t.Fatalf("CreateAtespace: %v", err)
+	}
+	if _, err := st.CreateActor(ctx, actor); err != nil {
+		t.Fatalf("CreateActor: %v", err)
+	}
+
+	if err := crashActor(ctx, st, actorRef, ateattr.OperationResume, ateattr.ReasonCorruptedAssignment); err != nil {
+		t.Fatalf("crashActor: %v", err)
+	}
+
+	assertCrashMetricDatapoint(t, reader, ateattr.OperationResume, ateattr.ReasonCorruptedAssignment, "demo-ns", "counter-template", "pool-1", "gvisor", 1)
+}
+
+func assertCrashMetricDatapoint(t *testing.T, reader *sdkmetric.ManualReader, wantOpName, wantReason, wantTmplNS, wantTmplName, wantWorkerPool, wantSandboxClass string, wantValue int64) {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "ate.actor.crashes" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				continue
+			}
+			for _, dp := range sum.DataPoints {
+				op, _ := dp.Attributes.Value(ateattr.ActorOperationNameKey)
+				r, _ := dp.Attributes.Value(ateattr.FailureReasonKey)
+				tNS, _ := dp.Attributes.Value(ateattr.TemplateNamespaceKey)
+				tName, _ := dp.Attributes.Value(ateattr.TemplateNameKey)
+				wp, _ := dp.Attributes.Value(ateattr.WorkerPoolNameKey)
+				sc, _ := dp.Attributes.Value(ateattr.SandboxClassKey)
+
+				if op.AsString() == wantOpName &&
+					r.AsString() == wantReason &&
+					tNS.AsString() == wantTmplNS &&
+					tName.AsString() == wantTmplName &&
+					wp.AsString() == wantWorkerPool &&
+					sc.AsString() == wantSandboxClass {
+					if dp.Value != wantValue {
+						t.Errorf("metric value = %d, want %d", dp.Value, wantValue)
+					}
+					return
+				}
+			}
+		}
+	}
+	t.Errorf("did not find ate.actor.crashes metric with attrs: opName=%q, reason=%q, tmplNS=%q, tmplName=%q, workerPool=%q, sandboxClass=%q",
+		wantOpName, wantReason, wantTmplNS, wantTmplName, wantWorkerPool, wantSandboxClass)
+}
+
+// failingUpdateWorkerStore wraps a store and fails every UpdateWorker call,
+// simulating a transient state-store error while releasing a worker.
+type failingUpdateWorkerStore struct {
+	store.Interface
+	err error
+}
+
+func (f failingUpdateWorkerStore) UpdateWorker(context.Context, *ateapipb.Worker, int64) error {
+	return f.err
+}
+
+// A transient failure releasing the worker must not move the actor to the
+// terminal CRASHED state: doing so would strand the still-assigned worker with
+// no actor left to drive a retry, permanently consuming the worker slot.
+// crashActor must return the error with the actor and worker left intact so the
+// caller retries and the worker is reclaimed.
+func TestCrashActorReleaseFailureLeavesWorkerReclaimable(t *testing.T) {
+	ctx := context.Background()
+	actorRef := resources.ActorRef{Atespace: "team-a", Name: "actor-1"}
+
+	st, cleanup := storetest.SetupTestStore(t)
+	defer cleanup()
+	seedActor(t, ctx, st, actorRef)
+	seedWorker(t, ctx, st, actorRef)
+
+	releaseErr := errors.New("state store unavailable")
+	err := crashActor(ctx, failingUpdateWorkerStore{Interface: st, err: releaseErr}, actorRef, ateattr.OperationUnknown, ateattr.ReasonUnknown)
+
+	if err == nil {
+		t.Fatal("crashActor() = nil, want error")
+	}
+	if !errors.Is(err, releaseErr) {
+		t.Errorf("crashActor() error = %v, want it to wrap %v", err, releaseErr)
+	}
+
+	// The actor must stay RUNNING with its worker assignment intact, so a retry
+	// can re-release the worker.
+	got, gerr := st.GetActor(ctx, actorRef)
+	if gerr != nil {
+		t.Fatalf("GetActor() = %v, want nil", gerr)
+	}
+	if got.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_RUNNING {
+		t.Errorf("status = %v, want %v (actor must not be crashed when the release fails)", got.GetStatus().GetState(), ateapipb.ActorState_ACTOR_STATE_RUNNING)
+	}
+	if got.GetStatus().GetWorkerAssignment() == nil {
+		t.Error("WorkerAssignment cleared, want preserved so the release can be retried")
+	}
+
+	// The worker must still be assigned to the actor (the failed release did not
+	// persist): it is not leaked, and a retry will reclaim it.
+	worker, werr := st.GetWorker(ctx, "uid")
+	if werr != nil {
+		t.Fatalf("GetWorker() = %v, want nil", werr)
+	}
+	if worker.GetStatus().GetAssignment() == nil {
+		t.Error("worker assignment = nil, want still assigned (release failed, must remain retriable)")
 	}
 }

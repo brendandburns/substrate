@@ -37,6 +37,9 @@ spec:
     - jsonPath: .status.replicas
       name: Replicas
       type: integer
+    - jsonPath: .status.readyReplicas
+      name: Ready
+      type: integer
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -97,9 +100,41 @@ spec:
                   SandboxClass is used.
                 type: string
               template:
-                description: Template holds optional pod scheduling and resource settings
-                  for worker pods.
+                description: Template holds optional metadata, scheduling, and resource
+                  settings for worker workloads.
                 properties:
+                  annotations:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Annotations are added to the generated Deployment and worker pods. Keys
+                      in the ate.dev domain and its subdomains are reserved for controllers.
+                    maxProperties: 64
+                    type: object
+                    x-kubernetes-validations:
+                    - message: ate.dev and its subdomains are reserved
+                      rule: self.all(key, !key.startsWith('ate.dev/') && !key.contains('.ate.dev/'))
+                    - message: annotation keys must be valid Kubernetes qualified
+                        names
+                      rule: self.all(key, !format.qualifiedName().validate(key).hasValue())
+                  labels:
+                    additionalProperties:
+                      description: |-
+                        WorkerPoolLabelValue is a Kubernetes label value for generated worker
+                        workloads.
+                      maxLength: 63
+                      pattern: ^(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?$
+                      type: string
+                    description: |-
+                      Labels are added to the generated Deployment and worker pods. Keys in
+                      the ate.dev domain and its subdomains are reserved for controllers.
+                    maxProperties: 64
+                    type: object
+                    x-kubernetes-validations:
+                    - message: ate.dev and its subdomains are reserved
+                      rule: self.all(key, !key.startsWith('ate.dev/') && !key.contains('.ate.dev/'))
+                    - message: label keys must be valid Kubernetes qualified names
+                      rule: self.all(key, !format.qualifiedName().validate(key).hasValue())
                   nodeAffinity:
                     description: |-
                       NodeAffinity scheduling rules for the worker pods. Mapped to
@@ -412,24 +447,29 @@ spec:
                     type: array
                     x-kubernetes-list-type: atomic
                 type: object
-              terminationGracePeriodSeconds:
-                default: 300
-                description: |-
-                  TerminationGracePeriodSeconds is the termination grace period applied to
-                  this pool's worker pods. On eviction, ateom traps SIGTERM and forwards it
-                  to the actor so it can save state and exit cleanly before the kubelet
-                  sends SIGKILL. Tune this to the maximum time your actors need to shut
-                  down gracefully. Defaults to 300 (5 minutes).
-                format: int32
-                minimum: 1
-                type: integer
             required:
             - ateomImage
             - replicas
             type: object
+            x-kubernetes-validations:
+            - message: nvidia.com/gpu is only supported when sandboxClass is 'gvisor'
+              rule: '!has(self.sandboxClass) || self.sandboxClass == ''gvisor'' ||
+                !has(self.template) || !has(self.template.resources) || !((has(self.template.resources.limits)
+                && ''nvidia.com/gpu'' in self.template.resources.limits) || (has(self.template.resources.requests)
+                && ''nvidia.com/gpu'' in self.template.resources.requests))'
+            - message: 'nvidia.com/gpu must be set in limits: Kubernetes does not
+                admit a request for an extended resource without a matching limit'
+              rule: '!has(self.template) || !has(self.template.resources) || !has(self.template.resources.requests)
+                || !(''nvidia.com/gpu'' in self.template.resources.requests) || (has(self.template.resources.limits)
+                && ''nvidia.com/gpu'' in self.template.resources.limits)'
           status:
             description: status is the observed state of WorkerPool
             properties:
+              readyReplicas:
+                description: ReadyReplicas is the number of ready worker pods.
+                format: int32
+                minimum: 0
+                type: integer
               replicas:
                 description: Replicas is the total number of worker pods.
                 format: int32

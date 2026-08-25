@@ -20,7 +20,7 @@ Envoy --(ext_proc RequestHeaders)--> router.handleRequestHeaders
 `ateapi`'s `AssignWorkerStep` claims a free worker from the actor's `WorkerPool`.
 In an oversubscribed system — the core premise of Substrate, where many actors
 multiplex onto few workers — a burst of traffic can momentarily exhaust the
-pool. `AssignWorkerStep` then returns `FailedPrecondition: "no free workers
+pool. `AssignWorkerStep` then returns `ResourceExhausted: "no free workers
 available"`.
 
 Previously the router mapped that straight to an HTTP `503` and failed the
@@ -30,12 +30,12 @@ user-visible error.
 
 ## Behavior
 
-With parking enabled (the default), the router treats `FailedPrecondition` and
-`Unavailable` from `ResumeActor` as **retryable** conditions (alongside the
-existing `Aborted` concurrent-resume conflict) — a parked request rides out
-transient pool saturation and control-plane blips (e.g. an ateapi rolling
-restart) alike. The request is *parked*: the resumer keeps retrying with
-exponential backoff until either
+With parking enabled (the default), the router treats `ResourceExhausted`,
+`FailedPrecondition` and `Unavailable` from `ResumeActor` as **retryable**
+conditions (alongside the existing `Aborted` concurrent-resume conflict) — a
+parked request rides out transient pool saturation and control-plane blips
+(e.g. an ateapi rolling restart) alike. The request is *parked*: the resumer
+keeps retrying with exponential backoff until either
 
 - the resume succeeds (the actor is `RUNNING` and has a worker IP) — the request
   is then routed normally; or
@@ -95,6 +95,17 @@ When parking is **disabled** (`--parked-request-max=0`), the router fails fast:
 `FailedPrecondition` and `Unavailable` are returned immediately, there is no
 admission cap, and only `Aborted` (concurrent-resume) conflicts are retried,
 within a `15s` budget.
+
+### Parked requests survive router shutdown
+
+A request parked when the router pod receives SIGTERM is **not** reset: the
+shutdown sequence keeps the ext_proc server (and, via a preStop handshake, the
+Envoy sidecar) alive until in-flight streams finish, and the ext_proc drain
+deadline (`--drain-timeout`) defaults to a value derived from
+`--parked-request-budget` and is validated at startup to be `>=` the budget —
+so a parked request always gets its full budget and a normal verdict (routed
+`200` or capacity `503`) even mid-termination. See the graceful-shutdown knobs
+(`--drain-delay`, `--drain-timeout`) in `manifests/ate-install/atenet-router.yaml`.
 
 ## Configuration
 

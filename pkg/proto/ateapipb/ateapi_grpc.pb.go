@@ -41,16 +41,26 @@ const (
 	Control_ResumeActor_FullMethodName            = "/ateapi.Control/ResumeActor"
 	Control_DeleteActor_FullMethodName            = "/ateapi.Control/DeleteActor"
 	Control_GetActorSnapshot_FullMethodName       = "/ateapi.Control/GetActorSnapshot"
+	Control_GetActorSnapshotTag_FullMethodName    = "/ateapi.Control/GetActorSnapshotTag"
 	Control_ListActorSnapshots_FullMethodName     = "/ateapi.Control/ListActorSnapshots"
-	Control_TagActorSnapshot_FullMethodName       = "/ateapi.Control/TagActorSnapshot"
+	Control_CreateActorSnapshotTag_FullMethodName = "/ateapi.Control/CreateActorSnapshotTag"
 	Control_UpdateActorSnapshotTag_FullMethodName = "/ateapi.Control/UpdateActorSnapshotTag"
 	Control_DeleteActorSnapshotTag_FullMethodName = "/ateapi.Control/DeleteActorSnapshotTag"
 	Control_ListWorkers_FullMethodName            = "/ateapi.Control/ListWorkers"
+	Control_GetWorker_FullMethodName              = "/ateapi.Control/GetWorker"
+	Control_CreateWorker_FullMethodName           = "/ateapi.Control/CreateWorker"
+	Control_UpdateWorker_FullMethodName           = "/ateapi.Control/UpdateWorker"
+	Control_DeleteWorker_FullMethodName           = "/ateapi.Control/DeleteWorker"
+	Control_DrainWorker_FullMethodName            = "/ateapi.Control/DrainWorker"
 	Control_ListActors_FullMethodName             = "/ateapi.Control/ListActors"
 	Control_CreateAtespace_FullMethodName         = "/ateapi.Control/CreateAtespace"
 	Control_GetAtespace_FullMethodName            = "/ateapi.Control/GetAtespace"
 	Control_ListAtespaces_FullMethodName          = "/ateapi.Control/ListAtespaces"
 	Control_DeleteAtespace_FullMethodName         = "/ateapi.Control/DeleteAtespace"
+	Control_CreateActorTemplate_FullMethodName    = "/ateapi.Control/CreateActorTemplate"
+	Control_GetActorTemplate_FullMethodName       = "/ateapi.Control/GetActorTemplate"
+	Control_ListActorTemplates_FullMethodName     = "/ateapi.Control/ListActorTemplates"
+	Control_DeleteActorTemplate_FullMethodName    = "/ateapi.Control/DeleteActorTemplate"
 )
 
 // ControlClient is the client API for Control service.
@@ -64,8 +74,10 @@ type ControlClient interface {
 	// Create a new Actor deriving from a given ActorTemplate.
 	CreateActor(ctx context.Context, in *CreateActorRequest, opts ...grpc.CallOption) (*Actor, error)
 	// Update mutable fields on an existing Actor.
-	UpdateActor(ctx context.Context, in *UpdateActorRequest, opts ...grpc.CallOption) (*UpdateActorResponse, error)
-	// Suspend a given actor to a new snapshot.
+	UpdateActor(ctx context.Context, in *UpdateActorRequest, opts ...grpc.CallOption) (*Actor, error)
+	// Suspend a given actor to a new snapshot. A running actor is checkpointed
+	// on its worker; a paused actor's node-local snapshot is uploaded, narrowed
+	// to the template's commit scope where required (Full capture, Data commit).
 	SuspendActor(ctx context.Context, in *SuspendActorRequest, opts ...grpc.CallOption) (*SuspendActorResponse, error)
 	// Pause a given actor and keep its snapshots on node VM.
 	PauseActor(ctx context.Context, in *PauseActorRequest, opts ...grpc.CallOption) (*PauseActorResponse, error)
@@ -75,10 +87,12 @@ type ControlClient interface {
 	DeleteActor(ctx context.Context, in *DeleteActorRequest, opts ...grpc.CallOption) (*Actor, error)
 	// Get an ActorSnapshot.
 	GetActorSnapshot(ctx context.Context, in *GetActorSnapshotRequest, opts ...grpc.CallOption) (*ActorSnapshot, error)
+	// Get an ActorSnapshot tag.
+	GetActorSnapshotTag(ctx context.Context, in *GetActorSnapshotTagRequest, opts ...grpc.CallOption) (*ActorSnapshotTag, error)
 	// List ActorSnapshots.
 	ListActorSnapshots(ctx context.Context, in *ListActorSnapshotsRequest, opts ...grpc.CallOption) (*ListActorSnapshotsResponse, error)
 	// Add an Atespace-owned, stable name for an ActorSnapshot.
-	TagActorSnapshot(ctx context.Context, in *TagActorSnapshotRequest, opts ...grpc.CallOption) (*ActorSnapshotTag, error)
+	CreateActorSnapshotTag(ctx context.Context, in *CreateActorSnapshotTagRequest, opts ...grpc.CallOption) (*ActorSnapshotTag, error)
 	// Publish or unpublish an ActorSnapshot tag without changing its address.
 	UpdateActorSnapshotTag(ctx context.Context, in *UpdateActorSnapshotTagRequest, opts ...grpc.CallOption) (*ActorSnapshotTag, error)
 	// Delete an ActorSnapshot tag. The snapshot becomes garbage-collectable when
@@ -86,6 +100,18 @@ type ControlClient interface {
 	DeleteActorSnapshotTag(ctx context.Context, in *DeleteActorSnapshotTagRequest, opts ...grpc.CallOption) (*ActorSnapshotTag, error)
 	// List Workers.
 	ListWorkers(ctx context.Context, in *ListWorkersRequest, opts ...grpc.CallOption) (*ListWorkersResponse, error)
+	// Get a Worker.
+	GetWorker(ctx context.Context, in *GetWorkerRequest, opts ...grpc.CallOption) (*Worker, error)
+	// Register a Worker. Called once its Pod is Ready and has an IP.
+	CreateWorker(ctx context.Context, in *CreateWorkerRequest, opts ...grpc.CallOption) (*Worker, error)
+	// Update observed pool state on a Worker.
+	UpdateWorker(ctx context.Context, in *UpdateWorkerRequest, opts ...grpc.CallOption) (*Worker, error)
+	// Deregister a Worker. Does not cascade: the caller is responsible for
+	// cleaning up related resources first.
+	DeleteWorker(ctx context.Context, in *DeleteWorkerRequest, opts ...grpc.CallOption) (*Worker, error)
+	// Mark a Worker as terminating so the scheduler stops routing new Actors to
+	// it. Idempotent; one-way. Deliberately leaves any bound Actor alone.
+	DrainWorker(ctx context.Context, in *DrainWorkerRequest, opts ...grpc.CallOption) (*Worker, error)
 	// List Actors.
 	ListActors(ctx context.Context, in *ListActorsRequest, opts ...grpc.CallOption) (*ListActorsResponse, error)
 	// Create a new Atespace. Substrate-native, stored in Redis.
@@ -97,6 +123,12 @@ type ControlClient interface {
 	// Delete an empty Atespace. Rejects (FailedPrecondition) if any Actors or
 	// ActorSnapshotTags remain.
 	DeleteAtespace(ctx context.Context, in *DeleteAtespaceRequest, opts ...grpc.CallOption) (*Atespace, error)
+	CreateActorTemplate(ctx context.Context, in *CreateActorTemplateRequest, opts ...grpc.CallOption) (*ActorTemplate, error)
+	GetActorTemplate(ctx context.Context, in *GetActorTemplateRequest, opts ...grpc.CallOption) (*ActorTemplate, error)
+	ListActorTemplates(ctx context.Context, in *ListActorTemplatesRequest, opts ...grpc.CallOption) (*ListActorTemplatesResponse, error)
+	// Delete an ActorTemplate together with its golden actor and golden
+	// snapshot in the ActorTemplate's namespace.
+	DeleteActorTemplate(ctx context.Context, in *DeleteActorTemplateRequest, opts ...grpc.CallOption) (*ActorTemplate, error)
 }
 
 type controlClient struct {
@@ -127,9 +159,9 @@ func (c *controlClient) CreateActor(ctx context.Context, in *CreateActorRequest,
 	return out, nil
 }
 
-func (c *controlClient) UpdateActor(ctx context.Context, in *UpdateActorRequest, opts ...grpc.CallOption) (*UpdateActorResponse, error) {
+func (c *controlClient) UpdateActor(ctx context.Context, in *UpdateActorRequest, opts ...grpc.CallOption) (*Actor, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(UpdateActorResponse)
+	out := new(Actor)
 	err := c.cc.Invoke(ctx, Control_UpdateActor_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -187,6 +219,16 @@ func (c *controlClient) GetActorSnapshot(ctx context.Context, in *GetActorSnapsh
 	return out, nil
 }
 
+func (c *controlClient) GetActorSnapshotTag(ctx context.Context, in *GetActorSnapshotTagRequest, opts ...grpc.CallOption) (*ActorSnapshotTag, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ActorSnapshotTag)
+	err := c.cc.Invoke(ctx, Control_GetActorSnapshotTag_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *controlClient) ListActorSnapshots(ctx context.Context, in *ListActorSnapshotsRequest, opts ...grpc.CallOption) (*ListActorSnapshotsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListActorSnapshotsResponse)
@@ -197,10 +239,10 @@ func (c *controlClient) ListActorSnapshots(ctx context.Context, in *ListActorSna
 	return out, nil
 }
 
-func (c *controlClient) TagActorSnapshot(ctx context.Context, in *TagActorSnapshotRequest, opts ...grpc.CallOption) (*ActorSnapshotTag, error) {
+func (c *controlClient) CreateActorSnapshotTag(ctx context.Context, in *CreateActorSnapshotTagRequest, opts ...grpc.CallOption) (*ActorSnapshotTag, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ActorSnapshotTag)
-	err := c.cc.Invoke(ctx, Control_TagActorSnapshot_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, Control_CreateActorSnapshotTag_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -231,6 +273,56 @@ func (c *controlClient) ListWorkers(ctx context.Context, in *ListWorkersRequest,
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListWorkersResponse)
 	err := c.cc.Invoke(ctx, Control_ListWorkers_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) GetWorker(ctx context.Context, in *GetWorkerRequest, opts ...grpc.CallOption) (*Worker, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Worker)
+	err := c.cc.Invoke(ctx, Control_GetWorker_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) CreateWorker(ctx context.Context, in *CreateWorkerRequest, opts ...grpc.CallOption) (*Worker, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Worker)
+	err := c.cc.Invoke(ctx, Control_CreateWorker_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) UpdateWorker(ctx context.Context, in *UpdateWorkerRequest, opts ...grpc.CallOption) (*Worker, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Worker)
+	err := c.cc.Invoke(ctx, Control_UpdateWorker_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) DeleteWorker(ctx context.Context, in *DeleteWorkerRequest, opts ...grpc.CallOption) (*Worker, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Worker)
+	err := c.cc.Invoke(ctx, Control_DeleteWorker_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) DrainWorker(ctx context.Context, in *DrainWorkerRequest, opts ...grpc.CallOption) (*Worker, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Worker)
+	err := c.cc.Invoke(ctx, Control_DrainWorker_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -287,6 +379,46 @@ func (c *controlClient) DeleteAtespace(ctx context.Context, in *DeleteAtespaceRe
 	return out, nil
 }
 
+func (c *controlClient) CreateActorTemplate(ctx context.Context, in *CreateActorTemplateRequest, opts ...grpc.CallOption) (*ActorTemplate, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ActorTemplate)
+	err := c.cc.Invoke(ctx, Control_CreateActorTemplate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) GetActorTemplate(ctx context.Context, in *GetActorTemplateRequest, opts ...grpc.CallOption) (*ActorTemplate, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ActorTemplate)
+	err := c.cc.Invoke(ctx, Control_GetActorTemplate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) ListActorTemplates(ctx context.Context, in *ListActorTemplatesRequest, opts ...grpc.CallOption) (*ListActorTemplatesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListActorTemplatesResponse)
+	err := c.cc.Invoke(ctx, Control_ListActorTemplates_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) DeleteActorTemplate(ctx context.Context, in *DeleteActorTemplateRequest, opts ...grpc.CallOption) (*ActorTemplate, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ActorTemplate)
+	err := c.cc.Invoke(ctx, Control_DeleteActorTemplate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlServer is the server API for Control service.
 // All implementations must embed UnimplementedControlServer
 // for forward compatibility.
@@ -298,8 +430,10 @@ type ControlServer interface {
 	// Create a new Actor deriving from a given ActorTemplate.
 	CreateActor(context.Context, *CreateActorRequest) (*Actor, error)
 	// Update mutable fields on an existing Actor.
-	UpdateActor(context.Context, *UpdateActorRequest) (*UpdateActorResponse, error)
-	// Suspend a given actor to a new snapshot.
+	UpdateActor(context.Context, *UpdateActorRequest) (*Actor, error)
+	// Suspend a given actor to a new snapshot. A running actor is checkpointed
+	// on its worker; a paused actor's node-local snapshot is uploaded, narrowed
+	// to the template's commit scope where required (Full capture, Data commit).
 	SuspendActor(context.Context, *SuspendActorRequest) (*SuspendActorResponse, error)
 	// Pause a given actor and keep its snapshots on node VM.
 	PauseActor(context.Context, *PauseActorRequest) (*PauseActorResponse, error)
@@ -309,10 +443,12 @@ type ControlServer interface {
 	DeleteActor(context.Context, *DeleteActorRequest) (*Actor, error)
 	// Get an ActorSnapshot.
 	GetActorSnapshot(context.Context, *GetActorSnapshotRequest) (*ActorSnapshot, error)
+	// Get an ActorSnapshot tag.
+	GetActorSnapshotTag(context.Context, *GetActorSnapshotTagRequest) (*ActorSnapshotTag, error)
 	// List ActorSnapshots.
 	ListActorSnapshots(context.Context, *ListActorSnapshotsRequest) (*ListActorSnapshotsResponse, error)
 	// Add an Atespace-owned, stable name for an ActorSnapshot.
-	TagActorSnapshot(context.Context, *TagActorSnapshotRequest) (*ActorSnapshotTag, error)
+	CreateActorSnapshotTag(context.Context, *CreateActorSnapshotTagRequest) (*ActorSnapshotTag, error)
 	// Publish or unpublish an ActorSnapshot tag without changing its address.
 	UpdateActorSnapshotTag(context.Context, *UpdateActorSnapshotTagRequest) (*ActorSnapshotTag, error)
 	// Delete an ActorSnapshot tag. The snapshot becomes garbage-collectable when
@@ -320,6 +456,18 @@ type ControlServer interface {
 	DeleteActorSnapshotTag(context.Context, *DeleteActorSnapshotTagRequest) (*ActorSnapshotTag, error)
 	// List Workers.
 	ListWorkers(context.Context, *ListWorkersRequest) (*ListWorkersResponse, error)
+	// Get a Worker.
+	GetWorker(context.Context, *GetWorkerRequest) (*Worker, error)
+	// Register a Worker. Called once its Pod is Ready and has an IP.
+	CreateWorker(context.Context, *CreateWorkerRequest) (*Worker, error)
+	// Update observed pool state on a Worker.
+	UpdateWorker(context.Context, *UpdateWorkerRequest) (*Worker, error)
+	// Deregister a Worker. Does not cascade: the caller is responsible for
+	// cleaning up related resources first.
+	DeleteWorker(context.Context, *DeleteWorkerRequest) (*Worker, error)
+	// Mark a Worker as terminating so the scheduler stops routing new Actors to
+	// it. Idempotent; one-way. Deliberately leaves any bound Actor alone.
+	DrainWorker(context.Context, *DrainWorkerRequest) (*Worker, error)
 	// List Actors.
 	ListActors(context.Context, *ListActorsRequest) (*ListActorsResponse, error)
 	// Create a new Atespace. Substrate-native, stored in Redis.
@@ -331,6 +479,12 @@ type ControlServer interface {
 	// Delete an empty Atespace. Rejects (FailedPrecondition) if any Actors or
 	// ActorSnapshotTags remain.
 	DeleteAtespace(context.Context, *DeleteAtespaceRequest) (*Atespace, error)
+	CreateActorTemplate(context.Context, *CreateActorTemplateRequest) (*ActorTemplate, error)
+	GetActorTemplate(context.Context, *GetActorTemplateRequest) (*ActorTemplate, error)
+	ListActorTemplates(context.Context, *ListActorTemplatesRequest) (*ListActorTemplatesResponse, error)
+	// Delete an ActorTemplate together with its golden actor and golden
+	// snapshot in the ActorTemplate's namespace.
+	DeleteActorTemplate(context.Context, *DeleteActorTemplateRequest) (*ActorTemplate, error)
 	mustEmbedUnimplementedControlServer()
 }
 
@@ -347,7 +501,7 @@ func (UnimplementedControlServer) GetActor(context.Context, *GetActorRequest) (*
 func (UnimplementedControlServer) CreateActor(context.Context, *CreateActorRequest) (*Actor, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateActor not implemented")
 }
-func (UnimplementedControlServer) UpdateActor(context.Context, *UpdateActorRequest) (*UpdateActorResponse, error) {
+func (UnimplementedControlServer) UpdateActor(context.Context, *UpdateActorRequest) (*Actor, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpdateActor not implemented")
 }
 func (UnimplementedControlServer) SuspendActor(context.Context, *SuspendActorRequest) (*SuspendActorResponse, error) {
@@ -365,11 +519,14 @@ func (UnimplementedControlServer) DeleteActor(context.Context, *DeleteActorReque
 func (UnimplementedControlServer) GetActorSnapshot(context.Context, *GetActorSnapshotRequest) (*ActorSnapshot, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetActorSnapshot not implemented")
 }
+func (UnimplementedControlServer) GetActorSnapshotTag(context.Context, *GetActorSnapshotTagRequest) (*ActorSnapshotTag, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetActorSnapshotTag not implemented")
+}
 func (UnimplementedControlServer) ListActorSnapshots(context.Context, *ListActorSnapshotsRequest) (*ListActorSnapshotsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListActorSnapshots not implemented")
 }
-func (UnimplementedControlServer) TagActorSnapshot(context.Context, *TagActorSnapshotRequest) (*ActorSnapshotTag, error) {
-	return nil, status.Error(codes.Unimplemented, "method TagActorSnapshot not implemented")
+func (UnimplementedControlServer) CreateActorSnapshotTag(context.Context, *CreateActorSnapshotTagRequest) (*ActorSnapshotTag, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateActorSnapshotTag not implemented")
 }
 func (UnimplementedControlServer) UpdateActorSnapshotTag(context.Context, *UpdateActorSnapshotTagRequest) (*ActorSnapshotTag, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpdateActorSnapshotTag not implemented")
@@ -379,6 +536,21 @@ func (UnimplementedControlServer) DeleteActorSnapshotTag(context.Context, *Delet
 }
 func (UnimplementedControlServer) ListWorkers(context.Context, *ListWorkersRequest) (*ListWorkersResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListWorkers not implemented")
+}
+func (UnimplementedControlServer) GetWorker(context.Context, *GetWorkerRequest) (*Worker, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetWorker not implemented")
+}
+func (UnimplementedControlServer) CreateWorker(context.Context, *CreateWorkerRequest) (*Worker, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateWorker not implemented")
+}
+func (UnimplementedControlServer) UpdateWorker(context.Context, *UpdateWorkerRequest) (*Worker, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateWorker not implemented")
+}
+func (UnimplementedControlServer) DeleteWorker(context.Context, *DeleteWorkerRequest) (*Worker, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteWorker not implemented")
+}
+func (UnimplementedControlServer) DrainWorker(context.Context, *DrainWorkerRequest) (*Worker, error) {
+	return nil, status.Error(codes.Unimplemented, "method DrainWorker not implemented")
 }
 func (UnimplementedControlServer) ListActors(context.Context, *ListActorsRequest) (*ListActorsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListActors not implemented")
@@ -394,6 +566,18 @@ func (UnimplementedControlServer) ListAtespaces(context.Context, *ListAtespacesR
 }
 func (UnimplementedControlServer) DeleteAtespace(context.Context, *DeleteAtespaceRequest) (*Atespace, error) {
 	return nil, status.Error(codes.Unimplemented, "method DeleteAtespace not implemented")
+}
+func (UnimplementedControlServer) CreateActorTemplate(context.Context, *CreateActorTemplateRequest) (*ActorTemplate, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateActorTemplate not implemented")
+}
+func (UnimplementedControlServer) GetActorTemplate(context.Context, *GetActorTemplateRequest) (*ActorTemplate, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetActorTemplate not implemented")
+}
+func (UnimplementedControlServer) ListActorTemplates(context.Context, *ListActorTemplatesRequest) (*ListActorTemplatesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListActorTemplates not implemented")
+}
+func (UnimplementedControlServer) DeleteActorTemplate(context.Context, *DeleteActorTemplateRequest) (*ActorTemplate, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteActorTemplate not implemented")
 }
 func (UnimplementedControlServer) mustEmbedUnimplementedControlServer() {}
 func (UnimplementedControlServer) testEmbeddedByValue()                 {}
@@ -560,6 +744,24 @@ func _Control_GetActorSnapshot_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Control_GetActorSnapshotTag_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetActorSnapshotTagRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).GetActorSnapshotTag(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_GetActorSnapshotTag_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).GetActorSnapshotTag(ctx, req.(*GetActorSnapshotTagRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Control_ListActorSnapshots_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListActorSnapshotsRequest)
 	if err := dec(in); err != nil {
@@ -578,20 +780,20 @@ func _Control_ListActorSnapshots_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Control_TagActorSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(TagActorSnapshotRequest)
+func _Control_CreateActorSnapshotTag_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateActorSnapshotTagRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(ControlServer).TagActorSnapshot(ctx, in)
+		return srv.(ControlServer).CreateActorSnapshotTag(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: Control_TagActorSnapshot_FullMethodName,
+		FullMethod: Control_CreateActorSnapshotTag_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ControlServer).TagActorSnapshot(ctx, req.(*TagActorSnapshotRequest))
+		return srv.(ControlServer).CreateActorSnapshotTag(ctx, req.(*CreateActorSnapshotTagRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -646,6 +848,96 @@ func _Control_ListWorkers_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ControlServer).ListWorkers(ctx, req.(*ListWorkersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_GetWorker_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetWorkerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).GetWorker(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_GetWorker_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).GetWorker(ctx, req.(*GetWorkerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_CreateWorker_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateWorkerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).CreateWorker(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_CreateWorker_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).CreateWorker(ctx, req.(*CreateWorkerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_UpdateWorker_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateWorkerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).UpdateWorker(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_UpdateWorker_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).UpdateWorker(ctx, req.(*UpdateWorkerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_DeleteWorker_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteWorkerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).DeleteWorker(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_DeleteWorker_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).DeleteWorker(ctx, req.(*DeleteWorkerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_DrainWorker_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DrainWorkerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).DrainWorker(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_DrainWorker_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).DrainWorker(ctx, req.(*DrainWorkerRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -740,6 +1032,78 @@ func _Control_DeleteAtespace_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Control_CreateActorTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateActorTemplateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).CreateActorTemplate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_CreateActorTemplate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).CreateActorTemplate(ctx, req.(*CreateActorTemplateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_GetActorTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetActorTemplateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).GetActorTemplate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_GetActorTemplate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).GetActorTemplate(ctx, req.(*GetActorTemplateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_ListActorTemplates_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListActorTemplatesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).ListActorTemplates(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_ListActorTemplates_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).ListActorTemplates(ctx, req.(*ListActorTemplatesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_DeleteActorTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteActorTemplateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).DeleteActorTemplate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_DeleteActorTemplate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).DeleteActorTemplate(ctx, req.(*DeleteActorTemplateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Control_ServiceDesc is the grpc.ServiceDesc for Control service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -780,12 +1144,16 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Control_GetActorSnapshot_Handler,
 		},
 		{
+			MethodName: "GetActorSnapshotTag",
+			Handler:    _Control_GetActorSnapshotTag_Handler,
+		},
+		{
 			MethodName: "ListActorSnapshots",
 			Handler:    _Control_ListActorSnapshots_Handler,
 		},
 		{
-			MethodName: "TagActorSnapshot",
-			Handler:    _Control_TagActorSnapshot_Handler,
+			MethodName: "CreateActorSnapshotTag",
+			Handler:    _Control_CreateActorSnapshotTag_Handler,
 		},
 		{
 			MethodName: "UpdateActorSnapshotTag",
@@ -798,6 +1166,26 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListWorkers",
 			Handler:    _Control_ListWorkers_Handler,
+		},
+		{
+			MethodName: "GetWorker",
+			Handler:    _Control_GetWorker_Handler,
+		},
+		{
+			MethodName: "CreateWorker",
+			Handler:    _Control_CreateWorker_Handler,
+		},
+		{
+			MethodName: "UpdateWorker",
+			Handler:    _Control_UpdateWorker_Handler,
+		},
+		{
+			MethodName: "DeleteWorker",
+			Handler:    _Control_DeleteWorker_Handler,
+		},
+		{
+			MethodName: "DrainWorker",
+			Handler:    _Control_DrainWorker_Handler,
 		},
 		{
 			MethodName: "ListActors",
@@ -818,6 +1206,22 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DeleteAtespace",
 			Handler:    _Control_DeleteAtespace_Handler,
+		},
+		{
+			MethodName: "CreateActorTemplate",
+			Handler:    _Control_CreateActorTemplate_Handler,
+		},
+		{
+			MethodName: "GetActorTemplate",
+			Handler:    _Control_GetActorTemplate_Handler,
+		},
+		{
+			MethodName: "ListActorTemplates",
+			Handler:    _Control_ListActorTemplates_Handler,
+		},
+		{
+			MethodName: "DeleteActorTemplate",
+			Handler:    _Control_DeleteActorTemplate_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
@@ -945,20 +1349,10 @@ const (
 //
 // ActorIdentity allows substrate workloads to exchange their
 // infrastructure-level credentials (k8s service account token, etc.) for a
-// substrate actor-level credential.  A given substrate actor might migrate
+// substrate actor-level credential. A given substrate actor might migrate
 // between many different physical workers over the course of its lifecycle,
 // whereas the actor credential's identity will be stable for the life of the
 // actor.
-//
-// This service requires authentication. You can authenticate with a Kubernetes
-// service account token in an `Authorization: Bearer` header, or you can
-// authenticate with a Kubernetes service account certificate as an mTLS
-// certificate. (Kubernetes service account certificates do not currently exist
-// upstream, but we will provide a polyfill based on Pod Certificates).
-//
-// The broker will check that the service credentials you authenticated with
-// belong to a Pod that is currently mapped to the requested actor in the
-// actor database.
 type ActorIdentityClient interface {
 	// Request an Actor Identity JWT.
 	//
@@ -971,10 +1365,9 @@ type ActorIdentityClient interface {
 	// it on the actor's behalf, authenticating with its own client certificate
 	// rather than a bearer token.
 	//
-	// Authorization is decided on that client certificate: it must identify the
-	// atelet running on the same node as the worker Pod that currently hosts the
-	// requested actor, and the actor must still be running. Any other caller is
-	// rejected with PERMISSION_DENIED.
+	// Authorization is decided on that client certificate and the worker
+	// identity attested by atelet. Ateapi verifies that the worker is assigned to
+	// the actor and that the actor points back to that exact worker before signing.
 	//
 	// The certificate in the response is the actor's identity, not the atelet's.
 	MintCert(ctx context.Context, in *MintCertRequest, opts ...grpc.CallOption) (*MintCertResponse, error)
@@ -1014,20 +1407,10 @@ func (c *actorIdentityClient) MintCert(ctx context.Context, in *MintCertRequest,
 //
 // ActorIdentity allows substrate workloads to exchange their
 // infrastructure-level credentials (k8s service account token, etc.) for a
-// substrate actor-level credential.  A given substrate actor might migrate
+// substrate actor-level credential. A given substrate actor might migrate
 // between many different physical workers over the course of its lifecycle,
 // whereas the actor credential's identity will be stable for the life of the
 // actor.
-//
-// This service requires authentication. You can authenticate with a Kubernetes
-// service account token in an `Authorization: Bearer` header, or you can
-// authenticate with a Kubernetes service account certificate as an mTLS
-// certificate. (Kubernetes service account certificates do not currently exist
-// upstream, but we will provide a polyfill based on Pod Certificates).
-//
-// The broker will check that the service credentials you authenticated with
-// belong to a Pod that is currently mapped to the requested actor in the
-// actor database.
 type ActorIdentityServer interface {
 	// Request an Actor Identity JWT.
 	//
@@ -1040,10 +1423,9 @@ type ActorIdentityServer interface {
 	// it on the actor's behalf, authenticating with its own client certificate
 	// rather than a bearer token.
 	//
-	// Authorization is decided on that client certificate: it must identify the
-	// atelet running on the same node as the worker Pod that currently hosts the
-	// requested actor, and the actor must still be running. Any other caller is
-	// rejected with PERMISSION_DENIED.
+	// Authorization is decided on that client certificate and the worker
+	// identity attested by atelet. Ateapi verifies that the worker is assigned to
+	// the actor and that the actor points back to that exact worker before signing.
 	//
 	// The certificate in the response is the actor's identity, not the atelet's.
 	MintCert(context.Context, *MintCertRequest) (*MintCertResponse, error)

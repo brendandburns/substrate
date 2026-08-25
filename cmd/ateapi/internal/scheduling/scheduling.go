@@ -23,6 +23,7 @@ import (
 	"slices"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.opentelemetry.io/otel/metric"
 	"k8s.io/apimachinery/pkg/labels"
 )
 
@@ -40,6 +41,15 @@ type Constraints struct {
 	// on one of these nodes. Used when the actor's latest snapshot is local
 	// to specific node VMs.
 	RequiredNodes []string
+
+	// CPUMilli and MemoryBytes are the actor's declared resource limits, from
+	// the ActorTemplate. A worker is eligible only if its reported capacity is
+	// >= these. Zero means "unconstrained" for that dimension (the actor did not
+	// declare a limit), and a worker that reports zero capacity for a dimension
+	// is treated as unconstrained too, so placement is never blocked by missing
+	// data (matching the pre-capacity behavior).
+	CPUMilli    int64
+	MemoryBytes int64
 }
 
 // ErrNoCapacity is returned by Schedule when no free worker satisfies the
@@ -66,6 +76,8 @@ type scheduler struct {
 	// intn returns a uniformly distributed random value in [0,n).
 	// Defaults to the global math/rand source
 	intn func(n int) int
+	// Records the number of eligible workers available during scheduling.
+	eligibleWorkers metric.Int64Histogram
 }
 
 // Option configures the Scheduler returned by New.
@@ -86,22 +98,33 @@ func New(source WorkerSource, opts ...Option) Scheduler {
 	return s
 }
 
+// Schedule filters the current worker fleet to find unassigned candidates matching the given constraints.
 func (s *scheduler) Schedule(ctx context.Context, constraints Constraints) (*ateapipb.Worker, error) {
 	workers, err := s.source.Workers()
 	if err != nil {
 		return nil, fmt.Errorf("while listing workers: %w", err)
 	}
 
+	// Filter for candidate workers that are unassigned and meet all scheduling constraints
+	matching := make([]*ateapipb.Worker, 0, len(workers))
 	var candidates []*ateapipb.Worker
 	for _, worker := range workers {
-		if worker.GetAssignment() == nil && s.Applies(worker, constraints) {
+		if !s.Applies(worker, constraints) {
+			continue
+		}
+		matching = append(matching, worker)
+		if worker.GetStatus().GetAssignment() == nil {
 			candidates = append(candidates, worker)
 		}
 	}
 
+	// Record telemetry on the number of eligible workers per pool/namespace before returning
+	s.recordEligibleWorkers(ctx, matching, constraints)
+
 	if len(candidates) == 0 {
 		return nil, ErrNoCapacity
 	}
+
 	return candidates[s.intn(len(candidates))], nil
 }
 
@@ -110,7 +133,7 @@ func (s *scheduler) Applies(worker *ateapipb.Worker, constraints Constraints) bo
 		return false
 	}
 
-	if worker.GetState() != ateapipb.Worker_STATE_ACTIVE {
+	if worker.GetStatus().GetState() != ateapipb.WorkerState_WORKER_STATE_ACTIVE {
 		return false
 	}
 
@@ -119,6 +142,18 @@ func (s *scheduler) Applies(worker *ateapipb.Worker, constraints Constraints) bo
 		return false
 	}
 	if constraints.ActorSelector != nil && !constraints.ActorSelector.Matches(set) {
+		return false
+	}
+
+	// The worker must be able to contain the actor's declared limits. A zero
+	// constraint (actor declared no limit) or zero worker capacity (capacity
+	// unknown) is treated as unconstrained, so placement is never blocked by
+	// missing data.
+	capacity := worker.GetCapacity()
+	if constraints.CPUMilli > 0 && capacity.GetCpuMilli() > 0 && capacity.GetCpuMilli() < constraints.CPUMilli {
+		return false
+	}
+	if constraints.MemoryBytes > 0 && capacity.GetMemoryBytes() > 0 && capacity.GetMemoryBytes() < constraints.MemoryBytes {
 		return false
 	}
 

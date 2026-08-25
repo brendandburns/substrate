@@ -30,7 +30,7 @@ type fakeWorkerPlugin struct {
 	unmounted  []string
 }
 
-func (f *fakeWorkerPlugin) MountVolume(ctx context.Context, volumeID string, targetPath string) error {
+func (f *fakeWorkerPlugin) MountVolume(ctx context.Context, volumeID string, targetPath string, attributes map[string]string) error {
 	return f.mountErr
 }
 
@@ -42,40 +42,42 @@ func (f *fakeWorkerPlugin) UnmountVolume(ctx context.Context, volumeID string, t
 var _ volume.VolumePluginWorkerPlane = (*fakeWorkerPlugin)(nil)
 
 func TestUnmountExternalVolumes(t *testing.T) {
-	origPlugin := globalVolumePlugin
-	defer func() { globalVolumePlugin = origPlugin }()
-
 	ctx := context.Background()
 	actorUID := "test-actor-123"
 
 	extVol1 := &ateletpb.Volume{
 		Name: "vol-1",
-		Type: ateletpb.VolumeType_VOLUME_TYPE_EXTERNAL,
 		Source: &ateletpb.Volume_External{
 			External: &ateletpb.ExternalVolumeSource{
 				StorageVolumeId: "mock-vol-1",
+				VolumeType:      "mock-driver",
 			},
 		},
 	}
 	extVol2 := &ateletpb.Volume{
 		Name: "vol-2",
-		Type: ateletpb.VolumeType_VOLUME_TYPE_EXTERNAL,
 		Source: &ateletpb.Volume_External{
 			External: &ateletpb.ExternalVolumeSource{
 				StorageVolumeId: "mock-vol-2",
+				VolumeType:      "mock-driver",
 			},
 		},
 	}
 	durableVol := &ateletpb.Volume{
 		Name: "durable-1",
-		Type: ateletpb.VolumeType_VOLUME_TYPE_DURABLE_DIR,
+		Source: &ateletpb.Volume_DurableDir{
+			DurableDir: &ateletpb.DurableDirVolume{},
+		},
 	}
 
 	t.Run("success", func(t *testing.T) {
 		fake := &fakeWorkerPlugin{}
-		globalVolumePlugin = fake
+		s := &AteomHerder{
+			volumePlugins: map[string]volume.VolumePluginWorkerPlane{
+				"mock-driver": fake,
+			},
+		}
 
-		s := &AteomHerder{}
 		err := s.unmountExternalVolumes(ctx, actorUID, []*ateletpb.Volume{extVol1, durableVol, extVol2})
 		if err != nil {
 			t.Fatalf("unmountExternalVolumes failed unexpectedly: %v", err)
@@ -89,9 +91,12 @@ func TestUnmountExternalVolumes(t *testing.T) {
 		fake := &fakeWorkerPlugin{
 			unmountErr: errors.New("device or resource busy"),
 		}
-		globalVolumePlugin = fake
+		s := &AteomHerder{
+			volumePlugins: map[string]volume.VolumePluginWorkerPlane{
+				"mock-driver": fake,
+			},
+		}
 
-		s := &AteomHerder{}
 		err := s.unmountExternalVolumes(ctx, actorUID, []*ateletpb.Volume{extVol1})
 		if err == nil {
 			t.Fatal("unmountExternalVolumes returned nil, want blocking error")
@@ -105,9 +110,12 @@ func TestUnmountExternalVolumes(t *testing.T) {
 		fake := &fakeWorkerPlugin{
 			unmountErr: fmt.Errorf("unmount failed"),
 		}
-		globalVolumePlugin = fake
+		s := &AteomHerder{
+			volumePlugins: map[string]volume.VolumePluginWorkerPlane{
+				"mock-driver": fake,
+			},
+		}
 
-		s := &AteomHerder{}
 		err := s.unmountExternalVolumes(ctx, actorUID, []*ateletpb.Volume{extVol1, extVol2})
 		if err == nil {
 			t.Fatal("unmountExternalVolumes returned nil, want blocking error")

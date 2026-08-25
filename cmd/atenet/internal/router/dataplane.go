@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+
+	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/ingress"
 )
 
 type dataplaneHealthCheck struct {
@@ -29,14 +31,17 @@ type dataplaneHealthCheck struct {
 	expectedBody string
 }
 
-func (r atenetRouter) routeViaAuthority() bool {
-	return r == atenetRouterAgentgateway
-}
+// Both dataplanes resolve the worker address from ext_proc's dynamic
+// metadata (see ingress.OriginalDstMetadataKey) and leave :authority/Host
+// untouched, so atunnel always authorizes by the actor's own DNS name --
+// ingress.New needs no per-dataplane routing mode.
 
 func (r atenetRouter) healthCheck() dataplaneHealthCheck {
 	switch r {
 	case atenetRouterEnvoy:
-		return dataplaneHealthCheck{url: "http://127.0.0.1:9901/ready", expectedBody: "LIVE"}
+		// localhost, not 127.0.0.1: the admin socket binds `::`, so the dial
+		// has to be able to fall through to the IPv6 loopback.
+		return dataplaneHealthCheck{url: "http://localhost:9901/ready", expectedBody: "LIVE"}
 	case atenetRouterAgentgateway:
 		return dataplaneHealthCheck{url: "http://127.0.0.1:15021/healthz/ready", expectedBody: "ready"}
 	default:
@@ -44,7 +49,7 @@ func (r atenetRouter) healthCheck() dataplaneHealthCheck {
 	}
 }
 
-func (s *RouterServer) startDataplane(ctx context.Context, g *errgroup.Group, parkCfg ParkedRequestConfig, traceRootSamplingPercent float64) error {
+func (s *RouterServer) startDataplane(ctx context.Context, g *errgroup.Group, parkCfg ingress.ParkedRequestConfig, traceRootSamplingPercent float64) error {
 	switch s.cfg.atenetRouter() {
 	case atenetRouterEnvoy:
 		s.startEnvoyDataplane(ctx, g, parkCfg, traceRootSamplingPercent)
@@ -56,14 +61,16 @@ func (s *RouterServer) startDataplane(ctx context.Context, g *errgroup.Group, pa
 	return nil
 }
 
-func (s *RouterServer) startEnvoyDataplane(ctx context.Context, g *errgroup.Group, parkCfg ParkedRequestConfig, traceRootSamplingPercent float64) {
+func (s *RouterServer) startEnvoyDataplane(ctx context.Context, g *errgroup.Group, parkCfg ingress.ParkedRequestConfig, traceRootSamplingPercent float64) {
 	xdsSrv := NewXdsServer(s.cfg.XdsPort)
 	xdsSrv.SetConfig(s.cfg.HttpPort, s.cfg.ExtprocPort, s.cfg.ExtprocAddr)
+	xdsSrv.SetConnectPorts(s.cfg.ConnectPlainTextPort, s.cfg.ConnectTLSPort)
 	setOtlpCollector(ctx, xdsSrv, s.cfg.OtlpCollectorAddress)
 	xdsSrv.SetTraceRootSamplingPercent(traceRootSamplingPercent)
 
+	xdsSrv.SetRouteTimeout(s.cfg.RouteTimeout)
 	xdsSrv.SetExtProcMaxRequests(s.cfg.extProcMaxRequests())
-	if parkCfg.enabled() {
+	if parkCfg.Enabled() {
 		// Envoy must keep a parked request open at least as long as the router
 		// will hold it; add a margin so the router surfaces its own 503 first.
 		xdsSrv.SetExtProcMessageTimeout(parkCfg.Budget + 5*time.Second)
@@ -71,7 +78,7 @@ func (s *RouterServer) startEnvoyDataplane(ctx context.Context, g *errgroup.Grou
 
 	xdsSrv.SetTlsConfig(s.cfg.HttpsPort, s.cfg.EnvoyCertPath)
 	xdsSrv.SetUpstreamTls(s.cfg.UpstreamCredentialBundlePath, s.cfg.UpstreamTrustBundlePath, s.cfg.UpstreamSpiffePrefix)
-	ctrl := NewController(s.k8sClient, s.clientset, s.cfg, xdsSrv, s.extprocSrv)
+	ctrl := NewController(s.atStore, xdsSrv)
 
 	// Envoy receives all routing configuration from the local xDS server.
 	g.Go(func() error {

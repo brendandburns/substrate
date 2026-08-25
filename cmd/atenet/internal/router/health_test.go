@@ -16,6 +16,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -79,7 +80,7 @@ func TestCheckDataplane(t *testing.T) {
 		{
 			name:        "envoy",
 			router:      atenetRouterEnvoy,
-			wantURL:     "http://127.0.0.1:9901/ready",
+			wantURL:     "http://localhost:9901/ready",
 			response:    "LIVE",
 			wantMessage: "LIVE",
 		},
@@ -109,6 +110,25 @@ func TestCheckDataplane(t *testing.T) {
 				t.Errorf("checkDataplane() = (%v, %q), want (true, %q)", healthy, message, tc.wantMessage)
 			}
 		})
+	}
+}
+
+// An egress-only router has no ingress dataplane beside it, so probing the
+// ingress proxy's admin port would report a dependency that is permanently
+// down.
+func TestCheckDataplaneSkippedInEgressMode(t *testing.T) {
+	rh := newRouterHealth(time.Second, nil, nil, routerConfig{Mode: ModeEgress})
+	rh.dataplaneClient = &http.Client{Transport: healthRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		t.Error("checkDataplane dialed the ingress dataplane admin port in egress mode")
+		return nil, errors.New("unexpected request")
+	})}
+
+	healthy, msg := rh.checkDataplane(context.Background())
+	if !healthy {
+		t.Errorf("checkDataplane healthy = false, want true (skipped)")
+	}
+	if !strings.Contains(msg, "Skipped") {
+		t.Errorf("checkDataplane message = %q, want it to report the check was skipped", msg)
 	}
 }
 
@@ -188,7 +208,7 @@ func TestHealthCheckDoesNotBlockReportOrStatusz(t *testing.T) {
 	}
 
 	statusServer := httptest.NewServer(http.HandlerFunc((&RouterServer{
-		cfg:    routerConfig{Standalone: true},
+		cfg:    routerConfig{},
 		health: rh,
 	}).handleStatusz))
 	defer statusServer.Close()

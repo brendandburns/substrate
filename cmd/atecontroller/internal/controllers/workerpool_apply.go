@@ -15,6 +15,8 @@
 package controllers
 
 import (
+	"os"
+
 	corev1 "k8s.io/api/core/v1"
 	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
@@ -27,6 +29,10 @@ import (
 // ateomOTelResourceAttributes mirrors atelet.yaml; service.instance.id is the pod
 // uid so each worker pod is a distinct telemetry source.
 const ateomOTelResourceAttributes = "k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.pod.uid=$(POD_UID),service.instance.id=$(POD_UID)"
+
+// workerTerminationGracePeriodSeconds is the hardcoded pod termination grace
+// period for worker pods (60 minutes).
+const workerTerminationGracePeriodSeconds int64 = 3600
 
 // ateomOTelSettings is the telemetry configuration propagated to ateom worker
 // pods. A zero value leaves the pods without telemetry env.
@@ -66,12 +72,25 @@ const (
 // are declared here. otel, when it carries an endpoint, is propagated to the
 // ateom container so it pushes telemetry to that collector.
 func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettings) *appsv1ac.DeploymentApplyConfiguration {
+	labels := map[string]string{}
+	annotations := map[string]string{}
+	if wp.Spec.Template != nil {
+		for key, value := range wp.Spec.Template.Labels {
+			labels[key] = string(value)
+		}
+		for key, value := range wp.Spec.Template.Annotations {
+			annotations[key] = value
+		}
+	}
+	labels["ate.dev/worker-pool"] = wp.Name
+
 	containerAC := corev1ac.Container().
 		WithName("ateom").
 		WithImage(wp.Spec.AteomImage).
 		WithArgs(
 			"--pod-uid=$(POD_UID)",
 			"--atunnel-listen-address=0.0.0.0:443",
+			"--atunnel-connect-listen-address=0.0.0.0:444",
 			"--atunnel-credential-bundle="+atunnelIdentityMountPath+"/credential-bundle.pem",
 			"--atunnel-trust-bundle="+atunnelIdentityMountPath+"/trust-bundle.pem",
 			"--atunnel-egress-listen-address=0.0.0.0:15001",
@@ -80,7 +99,11 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 		WithPorts(corev1ac.ContainerPort().
 			WithName("https").
 			WithContainerPort(443).
-			WithProtocol(corev1.ProtocolTCP)).
+			WithProtocol(corev1.ProtocolTCP),
+			corev1ac.ContainerPort().
+				WithName("connect").
+				WithContainerPort(444).
+				WithProtocol(corev1.ProtocolTCP)).
 		WithSecurityContext(ateomSecurityContext(wp.Spec.SandboxClass)).
 		WithEnv(ateomContainerEnv(otel)...).
 		WithVolumeMounts(
@@ -141,10 +164,13 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 
 	applyWorkerPoolPodTemplate(podSpecAC, containerAC, wp.Spec.Template)
 	maybeApplyMicroVMPodShape(podSpecAC, containerAC, wp.Spec.SandboxClass)
+	maybeApplyGPUPodShape(podSpecAC, containerAC, wp.Spec.Template, wp.Spec.SandboxClass)
 	podSpecAC.WithContainers(containerAC)
-	podSpecAC.WithTerminationGracePeriodSeconds(int64(workerTerminationGracePeriodSeconds(wp)))
+	podSpecAC.WithTerminationGracePeriodSeconds(workerTerminationGracePeriodSeconds)
 
 	return appsv1ac.Deployment(wp.Name, wp.Namespace).
+		WithLabels(labels).
+		WithAnnotations(annotations).
 		WithOwnerReferences(metav1ac.OwnerReference().
 			WithAPIVersion(atev1alpha1.GroupVersion.String()).
 			WithKind("WorkerPool").
@@ -157,9 +183,8 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 			WithSelector(metav1ac.LabelSelector().
 				WithMatchLabels(map[string]string{"ate.dev/worker-pool": wp.Name})).
 			WithTemplate(corev1ac.PodTemplateSpec().
-				WithLabels(map[string]string{
-					"ate.dev/worker-pool": wp.Name,
-				}).
+				WithLabels(labels).
+				WithAnnotations(annotations).
 				WithSpec(podSpecAC)))
 }
 
@@ -217,7 +242,8 @@ func fieldRefEnv(name, fieldPath string) *corev1ac.EnvVarApplyConfiguration {
 // veth and nftables rules (NET_ADMIN/NET_RAW), and the OCI rootfs is unpacked
 // and device nodes created as root over image-owned trees
 // (DAC_OVERRIDE/FOWNER/CHOWN/MKNOD). This replaces the former privileged worker;
-// the default seccomp and AppArmor profiles are sufficient (no Unconfined).
+// seccomp stays at the runtime default, but AppArmor must be Unconfined (see
+// ateomSecurityContext) since runsc's own mounts trip the default profile.
 var ateomGvisorCapabilities = []corev1.Capability{
 	"NET_ADMIN", "SYS_ADMIN", "SYS_CHROOT", "SYS_PTRACE",
 	"SETUID", "SETGID", "SETPCAP", "DAC_OVERRIDE",
@@ -248,19 +274,6 @@ func ateomSecurityContext(class atev1alpha1.SandboxClass) *corev1ac.SecurityCont
 			WithAdd(ateomGvisorCapabilities...)).
 		WithAppArmorProfile(corev1ac.AppArmorProfile().
 			WithType(corev1.AppArmorProfileTypeUnconfined))
-}
-
-// defaultTerminationGracePeriodSeconds is the fallback pod termination grace
-// period for worker pods (5 minutes), used when a WorkerPool does not set
-// spec.terminationGracePeriodSeconds. It matches the CRD default and gives
-// actors ample time to trap SIGTERM and save state before SIGKILL.
-const defaultTerminationGracePeriodSeconds int32 = 300
-
-func workerTerminationGracePeriodSeconds(wp *atev1alpha1.WorkerPool) int32 {
-	if wp.Spec.TerminationGracePeriodSeconds != nil {
-		return *wp.Spec.TerminationGracePeriodSeconds
-	}
-	return defaultTerminationGracePeriodSeconds
 }
 
 // maybeApplyMicroVMPodShape adds the /dev/kvm device and node placement a
@@ -308,6 +321,92 @@ func maybeApplyMicroVMPodShape(
 		WithOperator(corev1.TolerationOpEqual).
 		WithValue(string(atev1alpha1.SandboxClassMicroVM)).
 		WithEffect(corev1.TaintEffectNoSchedule))
+}
+
+// nvidiaToolkitContainerPath is where the host toolkit is mounted inside the
+// worker; ateom-gvisor's toolkitDir must match this. It sits outside
+// /usr/local/nvidia because the GPU device plugin mounts that tree into the
+// container read-only, and a mount cannot create its own mountpoint there, so
+// mounting under it only works when the toolkit happens to live inside the
+// directory the plugin mounts.
+const nvidiaToolkitContainerPath = "/opt/nvidia-toolkit"
+
+// defaultNvidiaToolkitHostPath is where gpu-operator installs the toolkit
+// (toolkit.installDir defaults to /usr/local/nvidia). It is deliberately not the
+// container path above: the two are independent, since where the node keeps the
+// toolkit says nothing about where we can mount it.
+const defaultNvidiaToolkitHostPath = "/usr/local/nvidia/toolkit"
+
+// nvidiaDriverRootEnv names the directory the GPU device plugin mounts the driver
+// into a pod at. ateom derives the driver library and binary paths from it, both of
+// which nvidia-ctk needs to generate a CDI spec. Only set it when the cluster's
+// device plugin does not use the /usr/local/nvidia convention; the controller
+// forwards its own value onto GPU worker pods.
+const nvidiaDriverRootEnv = "ATE_NVIDIA_DRIVER_ROOT"
+
+// nvidiaToolkitHostPath is where the NVIDIA container toolkit lives on the node.
+// It is platform-specific: gpu-operator and EKS install it at
+// /usr/local/nvidia/toolkit, while GKE keeps NVIDIA assets under
+// /home/kubernetes/bin/nvidia, so it is overridable via the
+// ATE_NVIDIA_TOOLKIT_HOST_PATH env var on the controller. We mount it read-only
+// so nvidia-ctk / nvidia-cdi-hook match whatever toolkit/driver the cluster runs.
+var nvidiaToolkitHostPath = envOrDefault("ATE_NVIDIA_TOOLKIT_HOST_PATH", defaultNvidiaToolkitHostPath)
+
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// maybeApplyGPUPodShape shapes a gVisor worker pod that requests a GPU so ateom
+// can inject the GPU into actors via CDI. It mounts the host NVIDIA toolkit
+// (version-matched to the node) read-only, for the glibc-based ateom image to run
+// directly. The pod keeps the same security posture as any other gVisor worker.
+// No-op for non-GPU pools and non-gVisor classes; an empty class defaults to
+// gVisor (WorkerPoolSpec kubebuilder default).
+func maybeApplyGPUPodShape(
+	podSpecAC *corev1ac.PodSpecApplyConfiguration,
+	containerAC *corev1ac.ContainerApplyConfiguration,
+	tmpl *atev1alpha1.WorkerPoolPodTemplate,
+	sandboxClass atev1alpha1.SandboxClass,
+) {
+	if sandboxClass != atev1alpha1.SandboxClassGvisor && sandboxClass != "" {
+		return
+	}
+	if !templateRequestsGPU(tmpl) {
+		return
+	}
+	// Mount the host NVIDIA toolkit (version-matched to the node) read-only.
+	containerAC.WithVolumeMounts(corev1ac.VolumeMount().
+		WithName("nvidia-toolkit").
+		WithMountPath(nvidiaToolkitContainerPath).
+		WithReadOnly(true))
+	podSpecAC.WithVolumes(corev1ac.Volume().
+		WithName("nvidia-toolkit").
+		WithHostPath(corev1ac.HostPathVolumeSource().
+			WithPath(nvidiaToolkitHostPath).
+			WithType(corev1.HostPathDirectory)))
+	// Only propagated when set, so a default deployment adds no env to worker pods.
+	if root := os.Getenv(nvidiaDriverRootEnv); root != "" {
+		containerAC.WithEnv(corev1ac.EnvVar().WithName(nvidiaDriverRootEnv).WithValue(root))
+	}
+}
+
+// templateRequestsGPU reports whether the pool template requests one or more
+// nvidia.com/gpu devices (limits or requests).
+func templateRequestsGPU(tmpl *atev1alpha1.WorkerPoolPodTemplate) bool {
+	if tmpl == nil || tmpl.Resources == nil {
+		return false
+	}
+	const gpu = corev1.ResourceName("nvidia.com/gpu")
+	if q, ok := tmpl.Resources.Limits[gpu]; ok && !q.IsZero() {
+		return true
+	}
+	if q, ok := tmpl.Resources.Requests[gpu]; ok && !q.IsZero() {
+		return true
+	}
+	return false
 }
 
 func applyWorkerPoolPodTemplate(

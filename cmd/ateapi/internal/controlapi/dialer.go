@@ -19,8 +19,11 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"slices"
+	"strconv"
 
+	"github.com/agent-substrate/substrate/internal/atelet"
 	"github.com/agent-substrate/substrate/internal/credbundle"
 	"github.com/agent-substrate/substrate/internal/substratex509"
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
@@ -35,6 +38,12 @@ import (
 )
 
 var ErrWorkerPodNotFound = errors.New("worker pod not found")
+
+// ErrNoAteletOnNode reports that the informer cache holds no atelet pod for
+// the requested node — e.g. the atelet is restarting, or the node is gone.
+// Distinct from ErrWorkerPodNotFound, which callers treat as crash-worthy;
+// this one is retryable.
+var ErrNoAteletOnNode = errors.New("no atelet pod found on node")
 
 // The SPIFFE identity that atelet serving certs carry, as minted by the
 // podidentity signer (cmd/podcertcontroller/internal/podidentitysigner).
@@ -55,10 +64,20 @@ type AteletDialer struct {
 	dialCredentials func(expectedPodUID string) (credentials.TransportCredentials, error)
 }
 
+// DialerOption customizes an AteletDialer built by NewAteletDialer.
+type DialerOption func(*AteletDialer)
+
+// WithDialCredentials overrides how transport credentials are built for a given
+// atelet pod UID. Tests use it to reach a fake atelet over insecure transport
+// while still exercising the real lookup, dial and connection-cache path.
+func WithDialCredentials(build func(expectedPodUID string) (credentials.TransportCredentials, error)) DialerOption {
+	return func(d *AteletDialer) { d.dialCredentials = build }
+}
+
 // NewAteletDialer creates a new AteletDialer. clientBundlePath and serverCAPath
 // are used to build the per-atelet mTLS credentials used for every atelet connection.
-func NewAteletDialer(workerIndexer cache.Indexer, ateletIndexer cache.Indexer, clientBundlePath, serverCAPath string) *AteletDialer {
-	return &AteletDialer{
+func NewAteletDialer(workerIndexer cache.Indexer, ateletIndexer cache.Indexer, clientBundlePath, serverCAPath string, opts ...DialerOption) *AteletDialer {
+	d := &AteletDialer{
 		workerIndexer: workerIndexer,
 		ateletIndexer: ateletIndexer,
 		ateletConns:   lru.New(1024),
@@ -70,6 +89,10 @@ func NewAteletDialer(workerIndexer cache.Indexer, ateletIndexer cache.Indexer, c
 			return credentials.NewTLS(tlsConfig), nil
 		},
 	}
+	for _, opt := range opts {
+		opt(d)
+	}
+	return d
 }
 
 // DialForWorker returns a gRPC connection to the Atelet running on the same node as the specified worker pod.
@@ -91,13 +114,30 @@ func (d *AteletDialer) DialForWorker(workerPodNamespace, workerPodName string) (
 
 	selectedWorker := matchingPods[0].(*corev1.Pod)
 
-	matchingAtelets, err := d.ateletIndexer.ByIndex(byNode, selectedWorker.Spec.NodeName)
+	conn, err := d.DialForAteletOnNode(selectedWorker.Spec.NodeName)
 	if err != nil {
-		return nil, fmt.Errorf("while finding atelet for worker pod %q on node %q: %w", workerPodKey, selectedWorker.Spec.NodeName, err)
+		return nil, fmt.Errorf("for worker pod %q: %w", workerPodKey, err)
+	}
+	return conn, nil
+}
+
+// DialForAteletOnNode resolves the single atelet pod on nodeName and dials it
+// with per-atelet pod-UID-pinned credentials, caching the connection by the
+// atelet's pod UID. Used directly when an actor has no worker assignment but
+// its state is pinned to a node — e.g. a PAUSED actor whose local snapshot
+// lives there. Returns ErrNoAteletOnNode if the informer cache holds no
+// atelet pod for the node.
+func (d *AteletDialer) DialForAteletOnNode(nodeName string) (*grpc.ClientConn, error) {
+	matchingAtelets, err := d.ateletIndexer.ByIndex(byNode, nodeName)
+	if err != nil {
+		return nil, fmt.Errorf("while finding atelet on node %q: %w", nodeName, err)
 	}
 
-	if len(matchingAtelets) != 1 {
-		return nil, fmt.Errorf("found %d atelet pods on node %q, expected 1", len(matchingAtelets), selectedWorker.Spec.NodeName)
+	if len(matchingAtelets) == 0 {
+		return nil, fmt.Errorf("%w: %q", ErrNoAteletOnNode, nodeName)
+	}
+	if len(matchingAtelets) > 1 {
+		return nil, fmt.Errorf("found %d atelet pods on node %q, expected 1", len(matchingAtelets), nodeName)
 	}
 
 	selectedAtelet := matchingAtelets[0].(*corev1.Pod)
@@ -118,7 +158,7 @@ func (d *AteletDialer) DialForWorker(workerPodNamespace, workerPodName string) (
 	}
 
 	ateletConn, err := grpc.NewClient(
-		selectedAtelet.Status.PodIPs[0].IP+":8085",
+		net.JoinHostPort(selectedAtelet.Status.PodIPs[0].IP, strconv.Itoa(atelet.DefaultPort)),
 		grpc.WithTransportCredentials(creds),
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	)

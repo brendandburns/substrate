@@ -23,6 +23,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -31,6 +32,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -55,12 +57,7 @@ func TestClientDialContext(t *testing.T) {
 	})
 	client := newTestClient(t, ca, WithDialer(dialFixedAddress(gatewayAddress)))
 
-	conn, err := client.DialContext(context.Background(), "192.0.2.10:443", EgressMetadata{
-		Atespace:     "team-a",
-		ActorName:    "actor-1",
-		ActorVersion: 7,
-		BearerToken:  "actor-token",
-	})
+	conn, err := client.DialContext(context.Background(), "192.0.2.10:443")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,17 +70,13 @@ func TestClientDialContext(t *testing.T) {
 	if gotRequest.Host != "192.0.2.10:443" {
 		t.Errorf("authority = %q, want 192.0.2.10:443", gotRequest.Host)
 	}
-	if got := gotRequest.Header.Get(ActorAtespaceHeader); got != "team-a" {
-		t.Errorf("%s = %q, want team-a", ActorAtespaceHeader, got)
+	for name := range gotRequest.Header {
+		if strings.HasPrefix(strings.ToLower(name), "x-ate-") {
+			t.Errorf("legacy identity header %q was sent", name)
+		}
 	}
-	if got := gotRequest.Header.Get(ActorNameHeader); got != "actor-1" {
-		t.Errorf("%s = %q, want actor-1", ActorNameHeader, got)
-	}
-	if got := gotRequest.Header.Get(ActorVersionHeader); got != "7" {
-		t.Errorf("%s = %q, want 7", ActorVersionHeader, got)
-	}
-	if got := gotRequest.Header.Get("Authorization"); got != "Bearer actor-token" {
-		t.Errorf("Authorization = %q, want Bearer actor-token", got)
+	if got := gotRequest.Header.Get("Authorization"); got != "" {
+		t.Errorf("Authorization = %q, want empty", got)
 	}
 
 	buffered := make([]byte, len("hello"))
@@ -106,13 +99,127 @@ func TestClientDialContextRejected(t *testing.T) {
 	})
 	client := newTestClient(t, ca, WithDialer(dialFixedAddress(gatewayAddress)))
 
-	_, err := client.DialContext(context.Background(), "192.0.2.10:443", EgressMetadata{
-		Atespace:     "team-a",
-		ActorName:    "actor-1",
-		ActorVersion: 7,
-	})
+	_, err := client.DialContext(context.Background(), "192.0.2.10:443")
 	if err == nil || !strings.Contains(err.Error(), "denied by policy") {
 		t.Fatalf("DialContext error = %v, want policy rejection", err)
+	}
+}
+
+// TestClientDialContextGatewayRefusesClientCertificate pins the classification
+// of a front-door refusal to ErrGatewayHandshake under both TLS versions, which
+// is not one behavior but two.
+//
+// Under 1.2 the server rejects the certificate mid-handshake and
+// HandshakeContext returns the error. Under 1.3 the client's handshake has
+// already returned nil by the time the server looks at the certificate, so the
+// refusal lands on the CONNECT exchange instead -- and 1.3 is what a real
+// gateway negotiates. A caller asking "did the door turn me away?" has to get
+// the same answer either way, or it is really asking which version was
+// negotiated.
+func TestClientDialContextGatewayRefusesClientCertificate(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		maxTLSVersion uint16
+	}{
+		{name: "TLS 1.3 refuses after the client handshake completes", maxTLSVersion: tls.VersionTLS13},
+		{name: "TLS 1.2 refuses during the handshake", maxTLSVersion: tls.VersionTLS12},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ca := newTestCA(t)
+			// The gateway trusts a different CA than the one that issued the
+			// client's certificate, which is the shape of an actor presenting a
+			// podidentity credential to a door that only accepts actor identity.
+			gatewayAddress := serveTestRefusingGateway(t, ca, newTestCA(t), tt.maxTLSVersion)
+			client := newTestClient(t, ca, WithDialer(dialFixedAddress(gatewayAddress)))
+
+			_, err := client.DialContext(context.Background(), "192.0.2.10:443")
+			if err == nil {
+				t.Fatal("DialContext succeeded against a gateway that refuses the client certificate")
+			}
+			if !errors.Is(err, ErrGatewayHandshake) {
+				t.Errorf("DialContext error = %v, want it to wrap ErrGatewayHandshake", err)
+			}
+			var rejected *ConnectRejectedError
+			if errors.As(err, &rejected) {
+				// A refusal at the door is not a CONNECT the gateway answered:
+				// conflating them would let an authorization denial read as an
+				// authentication failure.
+				t.Errorf("DialContext error = %v, want no ConnectRejectedError", err)
+			}
+		})
+	}
+}
+
+// TestClientDialContextGatewayHangsUpBeforeResponding covers the same window
+// without an alert in it: the gateway closes the connection after the handshake
+// and says nothing. There is still nobody but the front door on the other end,
+// since no CONNECT response means no upstream was ever dialed.
+func TestClientDialContextGatewayHangsUpBeforeResponding(t *testing.T) {
+	ca := newTestCA(t)
+	gatewayAddress := serveTestConnectGateway(t, ca, func(conn net.Conn, _ *http.Request) {
+		_ = conn.Close()
+	})
+	client := newTestClient(t, ca, WithDialer(dialFixedAddress(gatewayAddress)))
+
+	_, err := client.DialContext(context.Background(), "192.0.2.10:443")
+	if err == nil {
+		t.Fatal("DialContext succeeded against a gateway that hung up")
+	}
+	if !errors.Is(err, ErrGatewayHandshake) {
+		t.Errorf("DialContext error = %v, want it to wrap ErrGatewayHandshake", err)
+	}
+}
+
+// TestConnectExchangeError is the other half of gatewayHungUp: a failure on
+// this side of the connection must not be reported as the door refusing, or
+// "the gateway rejected my certificate" stops meaning anything. The cases are
+// exercised directly because the ones worth pinning -- a deadline, a response
+// the gateway did send but malformed -- are awkward to provoke through a real
+// listener and trivial to state as errors.
+func TestConnectExchangeError(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		err           error
+		wantFrontDoor bool
+	}{
+		{
+			name:          "peer TLS alert",
+			err:           &net.OpError{Op: "remote error", Err: errors.New("tls: unknown certificate authority")},
+			wantFrontDoor: true,
+		},
+		{
+			name:          "peer closed without alerting",
+			err:           io.EOF,
+			wantFrontDoor: true,
+		},
+		{
+			name:          "peer reset mid-response",
+			err:           io.ErrUnexpectedEOF,
+			wantFrontDoor: true,
+		},
+		{
+			name:          "peer reset while the CONNECT was going out",
+			err:           &net.OpError{Op: "write", Err: syscall.EPIPE},
+			wantFrontDoor: true,
+		},
+		{
+			name: "our own deadline expired",
+			err:  os.ErrDeadlineExceeded,
+		},
+		{
+			name: "the gateway answered, but not with HTTP",
+			err:  errors.New("malformed HTTP response \"garbage\""),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := connectExchangeError("reading CONNECT response", tt.err)
+			if got := errors.Is(err, ErrGatewayHandshake); got != tt.wantFrontDoor {
+				t.Errorf("errors.Is(%v, ErrGatewayHandshake) = %t, want %t", err, got, tt.wantFrontDoor)
+			}
+			if !errors.Is(err, tt.err) {
+				t.Errorf("%v no longer unwraps to the underlying %v", err, tt.err)
+			}
+		})
 	}
 }
 
@@ -122,37 +229,19 @@ func TestClientDialContextValidatesInput(t *testing.T) {
 	tests := []struct {
 		name        string
 		destination string
-		metadata    EgressMetadata
 	}{
 		{
 			name:        "destination has no port",
 			destination: "192.0.2.10",
-			metadata:    EgressMetadata{Atespace: "team-a", ActorName: "actor-1", ActorVersion: 7},
 		},
 		{
 			name:        "destination is a hostname",
 			destination: "example.com:443",
-			metadata:    EgressMetadata{Atespace: "team-a", ActorName: "actor-1", ActorVersion: 7},
-		},
-		{
-			name:        "invalid atespace",
-			destination: "192.0.2.10:443",
-			metadata:    EgressMetadata{Atespace: "TEAM A", ActorName: "actor-1", ActorVersion: 7},
-		},
-		{
-			name:        "invalid actor",
-			destination: "192.0.2.10:443",
-			metadata:    EgressMetadata{Atespace: "team-a", ActorName: "actor/1", ActorVersion: 7},
-		},
-		{
-			name:        "invalid actor version",
-			destination: "192.0.2.10:443",
-			metadata:    EgressMetadata{Atespace: "team-a", ActorName: "actor-1"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := client.DialContext(context.Background(), tt.destination, tt.metadata); err == nil {
+			if _, err := client.DialContext(context.Background(), tt.destination); err == nil {
 				t.Fatal("DialContext unexpectedly succeeded")
 			}
 		})
@@ -170,19 +259,18 @@ func dialFixedAddress(address string) DialFunc {
 func newTestClient(t *testing.T, ca *testCA, opts ...ClientOption) *Client {
 	t.Helper()
 	dir := t.TempDir()
-	bundlePath := filepath.Join(dir, "client.pem")
 	trustPath := filepath.Join(dir, "trust.pem")
-	writeCredentialBundle(t, bundlePath, ca.issue(t,
-		"spiffe://cluster.local/ns/ate-demo/sa/ateom",
+	certificate := ca.issue(t,
+		"spiffe://substrate-actor.local/atespace/team/actor/actor",
 		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-	))
+	)
 	if err := os.WriteFile(trustPath, ca.certPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	client, err := NewClient(ClientConfig{
 		GatewayAddress:       "127.0.0.1:1",
 		ServerName:           "egress.test",
-		CredentialBundlePath: bundlePath,
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &certificate, nil },
 		TrustBundlePath:      trustPath,
 	}, opts...)
 	if err != nil {
@@ -220,6 +308,45 @@ func serveTestConnectGateway(t *testing.T, ca *testCA, handle func(net.Conn, *ht
 			return
 		}
 		handle(conn, req)
+	}()
+	return listener.Addr().String()
+}
+
+// serveTestRefusingGateway serves a front door that presents a certificate from
+// serverCA and requires a client certificate from clientCA, so a client holding
+// one from anywhere else is turned away. maxVersion caps the negotiated TLS
+// version, which is what decides whether the refusal reaches the client during
+// its handshake or after it.
+//
+// It handshakes and closes rather than reading a request: a refused client
+// never gets to send one, and any error here is the refusal working.
+func serveTestRefusingGateway(t *testing.T, serverCA, clientCA *testCA, maxVersion uint16) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	clientCAs := x509.NewCertPool()
+	clientCAs.AppendCertsFromPEM(clientCA.certPEM)
+	config := &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		MaxVersion:   maxVersion,
+		Certificates: []tls.Certificate{issueDNSCertificate(t, serverCA, "egress.test")},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientCAs,
+	}
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		tlsConn := tls.Server(conn, config)
+		_ = tlsConn.Handshake()
+		_ = tlsConn.Close()
 	}()
 	return listener.Addr().String()
 }

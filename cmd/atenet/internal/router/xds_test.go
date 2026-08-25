@@ -43,7 +43,40 @@ import (
 	secretgrpc "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 	resourcev3 "github.com/envoyproxy/go-control-plane/pkg/resource/v3"
+
+	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/ingress"
+	"github.com/agent-substrate/substrate/internal/atunnel"
 )
+
+// assertDualStackIngress checks an ingress listener keeps its 0.0.0.0 primary
+// and gains exactly one "::" socket on the same port.
+func assertDualStackIngress(t *testing.T, l *listenerv3.Listener, wantPort uint32) {
+	t.Helper()
+
+	sa := l.GetAddress().GetSocketAddress()
+	if sa.GetAddress() != "0.0.0.0" {
+		t.Errorf("Expected address '0.0.0.0', got %s", sa.GetAddress())
+	}
+	if sa.GetPortValue() != wantPort {
+		t.Errorf("Expected port %d, got %d", wantPort, sa.GetPortValue())
+	}
+
+	addrs := l.GetAdditionalAddresses()
+	if len(addrs) != 1 {
+		t.Fatalf("Expected 1 additional address on %s, got %d", l.GetName(), len(addrs))
+	}
+
+	asa := addrs[0].GetAddress().GetSocketAddress()
+	if asa.GetAddress() != "::" {
+		t.Errorf("Expected additional address '::', got %s", asa.GetAddress())
+	}
+	if asa.GetIpv4Compat() {
+		t.Error("Expected additional address Ipv4Compat to be false")
+	}
+	if asa.GetPortValue() != wantPort {
+		t.Errorf("Expected additional port %d, got %d", wantPort, asa.GetPortValue())
+	}
+}
 
 func TestXdsServer_UpdateSnapshot(t *testing.T) {
 	server := NewXdsServer(18000)
@@ -147,14 +180,7 @@ func TestXdsServer_UpdateSnapshot(t *testing.T) {
 	if raw, exists := listenersMap[IngressHTTPListener]; !exists {
 		t.Errorf("Listener name '%s' is missing from snapshot listeners", IngressHTTPListener)
 	} else {
-		l := raw.(*listenerv3.Listener)
-		sa := l.GetAddress().GetSocketAddress()
-		if sa.GetPortValue() != 8081 {
-			t.Errorf("Expected port 8081, got %d", sa.GetPortValue())
-		}
-		if sa.GetAddress() != "0.0.0.0" {
-			t.Errorf("Expected address '0.0.0.0', got %s", sa.GetAddress())
-		}
+		assertDualStackIngress(t, raw.(*listenerv3.Listener), 8081)
 	}
 }
 
@@ -189,10 +215,7 @@ func TestXdsServer_UpdateSnapshot_WithHttps(t *testing.T) {
 		t.Errorf("Listener name '%s' is missing from snapshot listeners", IngressHTTPSListener)
 	} else {
 		l := raw.(*listenerv3.Listener)
-		sa := l.GetAddress().GetSocketAddress()
-		if sa.GetPortValue() != 8443 {
-			t.Errorf("Expected port 8443, got %d", sa.GetPortValue())
-		}
+		assertDualStackIngress(t, l, 8443)
 
 		// Verify the TLS config references the serving cert via SDS rather
 		// than embedding it: inline filename DataSources are read only once
@@ -275,6 +298,103 @@ func TestXdsServer_UpdateSnapshot_HttpsWithoutCertPath(t *testing.T) {
 	}
 	if got := snap.GetResources(resourcev3.SecretType); len(got) != 0 {
 		t.Errorf("Expected no secrets without a cert path, got %d", len(got))
+	}
+}
+
+// TestXdsServer_UpdateSnapshot_ConnectDisabledByDefault locks in that the
+// CONNECT-terminating listeners/cluster are opt-in: with SetConnectPorts never
+// called (both ports default to 0), UpdateSnapshot must produce exactly the
+// same resources as if CONNECT support didn't exist, matching the HTTPS
+// listener's existing httpsPort>0 gating convention.
+func TestXdsServer_UpdateSnapshot_ConnectDisabledByDefault(t *testing.T) {
+	server := NewXdsServer(18000)
+	server.SetConfig(8085, 50053, "127.0.0.1")
+
+	if err := server.UpdateSnapshot(); err != nil {
+		t.Fatalf("UpdateSnapshot failed: %v", err)
+	}
+	res, err := server.snapshot.GetSnapshot(NodeID)
+	if err != nil {
+		t.Fatalf("Failed to get snapshot: %v", err)
+	}
+	snap := res.(*cachev3.Snapshot)
+
+	clustersMap := snap.GetResources(resourcev3.ClusterType)
+	if _, exists := clustersMap[MainInternalName]; exists {
+		t.Errorf("%s cluster must not be built when CONNECT is disabled", MainInternalName)
+	}
+	if len(clustersMap) != 2 {
+		t.Errorf("Expected 2 cluster definitions with CONNECT disabled, got %d", len(clustersMap))
+	}
+
+	listenersMap := snap.GetResources(resourcev3.ListenerType)
+	for _, name := range []string{"connect_terminate", "connect_terminate_tls", MainInternalName} {
+		if _, exists := listenersMap[name]; exists {
+			t.Errorf("listener %q must not be built when CONNECT is disabled", name)
+		}
+	}
+	if len(listenersMap) != 1 {
+		t.Errorf("Expected only the HTTP listener with CONNECT disabled, got %d listeners", len(listenersMap))
+	}
+}
+
+// TestXdsServer_UpdateSnapshot_WithConnect enables both the plaintext and TLS
+// CONNECT listeners and checks the resources they need are wired up,
+// including that the TLS CONNECT listener triggers the shared cert secret
+// even when the ordinary HTTPS listener (httpsPort) is left disabled.
+func TestXdsServer_UpdateSnapshot_WithConnect(t *testing.T) {
+	const certPath = "/run/servicedns.podcert.ate.dev/credential-bundle.pem"
+
+	server := NewXdsServer(18000)
+	server.SetConfig(8085, 50053, "127.0.0.1")
+	server.SetConnectPorts(8081, 8444)
+	// httpsPort left at 0: only the CONNECT-TLS listener wants the cert here.
+	server.SetTlsConfig(0, certPath)
+
+	if err := server.UpdateSnapshot(); err != nil {
+		t.Fatalf("UpdateSnapshot failed: %v", err)
+	}
+	res, err := server.snapshot.GetSnapshot(NodeID)
+	if err != nil {
+		t.Fatalf("Failed to get snapshot: %v", err)
+	}
+	snap := res.(*cachev3.Snapshot)
+	if err := snap.Consistent(); err != nil {
+		t.Fatalf("Integrity check failed on snapshot: %v", err)
+	}
+
+	clustersMap := snap.GetResources(resourcev3.ClusterType)
+	if _, exists := clustersMap[MainInternalName]; !exists {
+		t.Errorf("%s cluster missing with CONNECT enabled", MainInternalName)
+	}
+
+	listenersMap := snap.GetResources(resourcev3.ListenerType)
+	if _, exists := listenersMap[IngressHTTPSListener]; exists {
+		t.Error("plain HTTPS listener must not be built when only httpsPort is left disabled")
+	}
+	if raw, exists := listenersMap["connect_terminate"]; !exists {
+		t.Error("connect_terminate listener missing")
+	} else {
+		assertDualStackIngress(t, raw.(*listenerv3.Listener), 8081)
+	}
+	if raw, exists := listenersMap["connect_terminate_tls"]; !exists {
+		t.Error("connect_terminate_tls listener missing")
+	} else {
+		l := raw.(*listenerv3.Listener)
+		assertDualStackIngress(t, l, 8444)
+		ts := l.GetFilterChains()[0].GetTransportSocket()
+		if ts.GetName() != "envoy.transport_sockets.tls" {
+			t.Errorf("Expected connect_terminate_tls to be TLS-wrapped, got transport socket %q", ts.GetName())
+		}
+	}
+	if _, exists := listenersMap[MainInternalName]; !exists {
+		t.Errorf("%s listener missing with CONNECT enabled", MainInternalName)
+	}
+
+	// The TLS CONNECT listener alone must be enough to require the secret.
+	secretsMap := snap.GetResources(resourcev3.SecretType)
+	if _, exists := secretsMap[HTTPSCertSecretName]; !exists {
+		t.Error("cert secret missing even though connect_terminate_tls needs it")
 	}
 }
 
@@ -540,8 +660,8 @@ func TestXdsServer_ExtProcCircuitBreaker(t *testing.T) {
 		if got != uint32(defaultExtProcMaxRequests) {
 			t.Errorf("default max_requests = %d, want %d", got, defaultExtProcMaxRequests)
 		}
-		if got < uint32(defaultParkedRequestMax) {
-			t.Errorf("default breaker (%d) below the default lot (%d): a full lot would be truncated by Envoy", got, defaultParkedRequestMax)
+		if got < uint32(ingress.DefaultParkedRequestMax) {
+			t.Errorf("default breaker (%d) below the default lot (%d): a full lot would be truncated by Envoy", got, ingress.DefaultParkedRequestMax)
 		}
 	})
 
@@ -562,6 +682,156 @@ func TestXdsServer_ExtProcCircuitBreaker(t *testing.T) {
 			t.Errorf("max_requests after SetExtProcMaxRequests(0) = %d, want default %d", got, defaultExtProcMaxRequests)
 		}
 	})
+}
+
+func TestXdsServer_RouteTimeout(t *testing.T) {
+	// routeAction digs out the one workload route buildRoutes emits, which is
+	// where Envoy actually reads its timeouts.
+	//
+	// It pins the route to OriginalDstClusterName rather than trusting position:
+	// that is the cluster carrying actor traffic to the worker's atunnel ingress.
+	// A change that moves actor traffic onto some other route would otherwise
+	// leave this passing while the timeouts govern a route nothing uses.
+	routeAction := func(t *testing.T, x *XdsServer) *routev3.RouteAction {
+		t.Helper()
+		hosts := x.buildRoutes().GetVirtualHosts()
+		if len(hosts) != 1 || len(hosts[0].GetRoutes()) != 1 {
+			t.Fatalf("buildRoutes() = %d virtual hosts, want exactly 1 with 1 route", len(hosts))
+		}
+		action := hosts[0].GetRoutes()[0].GetRoute()
+		if got := action.GetCluster(); got != OriginalDstClusterName {
+			t.Fatalf("workload route targets cluster %q, want %q", got, OriginalDstClusterName)
+		}
+		return action
+	}
+	routeTimeout := func(t *testing.T, x *XdsServer) time.Duration {
+		t.Helper()
+		return routeAction(t, x).GetTimeout().AsDuration()
+	}
+	idleTimeout := func(t *testing.T, x *XdsServer) time.Duration {
+		t.Helper()
+		return routeAction(t, x).GetIdleTimeout().AsDuration()
+	}
+
+	t.Run("Default", func(t *testing.T) {
+		if got := routeTimeout(t, NewXdsServer(0)); got != defaultRouteTimeout {
+			t.Errorf("default route timeout = %v, want %v", got, defaultRouteTimeout)
+		}
+	})
+
+	t.Run("SetterOverrides", func(t *testing.T) {
+		x := NewXdsServer(0)
+		x.SetRouteTimeout(5 * time.Minute)
+		if got := routeTimeout(t, x); got != 5*time.Minute {
+			t.Errorf("route timeout after SetRouteTimeout(5m) = %v, want 5m", got)
+		}
+	})
+
+	// The flag cannot produce a zero: --route-timeout carries defaultRouteTimeout,
+	// so an operator who never passes it gets 10s, not 0. The guard is on the
+	// setter because SetRouteTimeout is part of the type's API and reachable
+	// from any caller, and because a zero here is the one value Envoy reads as
+	// "no timeout at all" — a mis-set knob would silently turn every stuck
+	// actor into a held-open request rather than failing visibly. The sibling
+	// setters guard the same way.
+	t.Run("NonPositiveKeepsDefault", func(t *testing.T) {
+		for _, d := range []time.Duration{0, -time.Second} {
+			x := NewXdsServer(0)
+			x.SetRouteTimeout(d)
+			if got := routeTimeout(t, x); got != defaultRouteTimeout {
+				t.Errorf("route timeout after SetRouteTimeout(%v) = %v, want default %v", d, got, defaultRouteTimeout)
+			}
+		}
+	})
+
+	// The route timeout alone does not bound a long turn. A stream carrying no
+	// bytes while the actor works is idle by Envoy's reckoning, and Envoy resets
+	// it at the 5m stream idle default whatever the route timeout says. These
+	// pin the relationship: the idle timer never bites before the ceiling the
+	// operator asked for, and it is not tightened below what applies today.
+	t.Run("IdleTimeoutTracksLongerRouteTimeout", func(t *testing.T) {
+		x := NewXdsServer(0)
+		x.SetRouteTimeout(30 * time.Minute)
+		if got := idleTimeout(t, x); got != 30*time.Minute {
+			t.Errorf("idle timeout with a 30m route timeout = %v, want 30m: a shorter idle timer would reset the stream first", got)
+		}
+	})
+
+	t.Run("IdleTimeoutKeepsEnvoyDefaultWhenRouteTimeoutIsShorter", func(t *testing.T) {
+		for _, d := range []time.Duration{defaultRouteTimeout, envoyDefaultStreamIdleTimeout} {
+			x := NewXdsServer(0)
+			x.SetRouteTimeout(d)
+			if got := idleTimeout(t, x); got != envoyDefaultStreamIdleTimeout {
+				t.Errorf("idle timeout with a %v route timeout = %v, want %v (unchanged from Envoy's default)", d, got, envoyDefaultStreamIdleTimeout)
+			}
+		}
+	})
+}
+
+// TestXdsServer_BuildOriginalDstCluster_UsesMetadataKey covers the fix for a
+// header-mutation-only LB config: a header only works for HTTP traffic, so
+// the ORIGINAL_DST cluster must resolve its destination from
+// ingress.OriginalDstMetadataKey/ingress.OriginalDstAddressKey dynamic
+// metadata instead (see buildOriginalDstCluster and
+// ingress.Handler.HandleRequestHeaders).
+func TestXdsServer_BuildOriginalDstCluster_UsesMetadataKey(t *testing.T) {
+	x := NewXdsServer(18000)
+	lbConfig := x.buildOriginalDstCluster().GetLbConfig().(*clusterv3.Cluster_OriginalDstLbConfig_).OriginalDstLbConfig
+	if lbConfig.GetUseHttpHeader() {
+		t.Error("UseHttpHeader must not be set: it only applies to HTTP traffic, and dynamic metadata is the mechanism ext_proc uses instead")
+	}
+	key := lbConfig.GetMetadataKey()
+	if key.GetKey() != ingress.OriginalDstMetadataKey {
+		t.Errorf("Expected MetadataKey.Key %q, got %q", ingress.OriginalDstMetadataKey, key.GetKey())
+	}
+	path := key.GetPath()
+	if len(path) != 1 || path[0].GetKey() != ingress.OriginalDstAddressKey {
+		t.Errorf("Expected MetadataKey.Path [%q], got %v", ingress.OriginalDstAddressKey, path)
+	}
+}
+
+// TestXdsServer_BuildRoutes_DerivesTargetPortHeader covers the fix for atunnel
+// needing the target port as a real header (it can't read Envoy's dynamic
+// metadata directly): rather than ext_proc building that header mutation
+// itself, the route derives it declaratively from the same
+// ingress.OriginalDstMetadataKey/ingress.OriginalDstPortKey metadata ext_proc
+// already writes for the cluster's own MetadataKey, via a
+// %DYNAMIC_METADATA(...)% command operator.
+func TestXdsServer_BuildRoutes_DerivesTargetPortHeader(t *testing.T) {
+	x := NewXdsServer(18000)
+	route := x.buildRoutes().GetVirtualHosts()[0].GetRoutes()[0]
+
+	headers := route.GetRequestHeadersToAdd()
+	if len(headers) != 1 {
+		t.Fatalf("Expected exactly 1 request header to add, got %d: %v", len(headers), headers)
+	}
+	h := headers[0]
+	if got, want := h.GetHeader().GetKey(), atunnel.TargetPortHeader; got != want {
+		t.Errorf("Expected header key %q, got %q", want, got)
+	}
+	wantValue := "%DYNAMIC_METADATA(" + ingress.OriginalDstMetadataKey + ":" + ingress.OriginalDstPortKey + ")%"
+	if got := h.GetHeader().GetValue(); got != wantValue {
+		t.Errorf("Expected header value %q, got %q", wantValue, got)
+	}
+	if got, want := h.GetAppendAction(), corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD; got != want {
+		t.Errorf("Expected append action %s, got %s", want, got)
+	}
+}
+
+// TestBuildConnectRoutes_DisablesTimeout covers a real bug: unlike a
+// WebSocket upgrade, Envoy never disables a route's timeout once a CONNECT
+// tunnel is established, so an unset Timeout here would fall back to Envoy's
+// global default of 15s and silently kill every CONNECT tunnel through this
+// router after 15 seconds regardless of activity.
+func TestBuildConnectRoutes_DisablesTimeout(t *testing.T) {
+	route := buildConnectRoutes().GetVirtualHosts()[0].GetRoutes()[0]
+	timeout := route.GetRoute().GetTimeout()
+	if timeout == nil {
+		t.Fatal("Expected an explicit Timeout, got nil (falls back to Envoy's 15s default)")
+	}
+	if timeout.AsDuration() != 0 {
+		t.Errorf("Expected Timeout 0 (disabled), got %s", timeout.AsDuration())
+	}
 }
 
 func TestXdsServer_SetOtlpCollector(t *testing.T) {
@@ -711,5 +981,38 @@ func TestXdsServer_BuildTracingRandomSamplingFromPolicy(t *testing.T) {
 				t.Errorf("RandomSampling = %v, want %v", got, tt.wantPercent)
 			}
 		})
+	}
+}
+
+func TestSnapshotVersionsUniqueAcrossRestarts(t *testing.T) {
+	deployAndGetVersion := func(t *testing.T, x *XdsServer) string {
+		t.Helper()
+		if err := x.UpdateSnapshot(); err != nil {
+			t.Fatalf("UpdateSnapshot: %v", err)
+		}
+		snap, err := x.snapshot.GetSnapshot(NodeID)
+		if err != nil {
+			t.Fatalf("GetSnapshot: %v", err)
+		}
+		return snap.GetVersion(resourcev3.ClusterType)
+	}
+
+	seen := map[string]bool{}
+	first := NewXdsServer(0)
+	for range 3 {
+		v := deployAndGetVersion(t, first)
+		if seen[v] {
+			t.Fatalf("version %q minted twice by the same server", v)
+		}
+		seen[v] = true
+	}
+
+	restarted := NewXdsServer(0)
+	for range 3 {
+		v := deployAndGetVersion(t, restarted)
+		if seen[v] {
+			t.Fatalf("version %q reused after restart; Envoy holding that version would not receive the new config", v)
+		}
+		seen[v] = true
 	}
 }
